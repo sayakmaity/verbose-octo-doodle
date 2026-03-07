@@ -24,13 +24,12 @@ async function restoreAndStart() {
   lastHistoryId = stored.lastHistoryId || null;
   pushActive = !!stored.pushActive;
 
-  if (pushActive) {
-    await reregisterPushSubscription();
-  }
-
   if (stored.monitoring) {
     isMonitoring = true;
-    ensurePollLoop();
+    if (pushActive) {
+      await reregisterPushSubscription();
+      setupGmailWatch().catch((err) => console.warn('Watch renewal on startup failed:', err.message));
+    }
   }
 }
 
