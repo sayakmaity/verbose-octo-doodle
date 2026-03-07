@@ -2,14 +2,11 @@ importScripts('config.js');
 const GCP_TOPIC_NAME = CONFIG.GCP_TOPIC_NAME;
 const VAPID_PUBLIC_KEY = CONFIG.VAPID_PUBLIC_KEY;
 const REGISTER_PUSH_URL = CONFIG.REGISTER_PUSH_URL;
-const POLL_INTERVAL_MS = 3000;
-const PUSH_POLL_FALLBACK_MS = 5 * 60 * 1000;
 const MAX_PROCESSED_CACHE = 200;
 
 // --- State ---
 let lastHistoryId = null;
 let isMonitoring = false;
-let pollTimeoutId = null;
 let processedMessageIds = new Set();
 let pushActive = false;
 
@@ -19,7 +16,6 @@ chrome.runtime.onInstalled.addListener(() => restoreAndStart());
 chrome.runtime.onStartup.addListener(() => restoreAndStart());
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'gmail-poll-fallback') restoreAndStart();
   if (alarm.name === 'gmail-watch-renew') setupGmailWatch().catch(console.error);
 });
 
@@ -154,53 +150,24 @@ async function startMonitoring() {
     console.error('Failed to initialize:', err);
   }
 
-  // Try to enable push (watch + subscription)
+  // Enable push (watch + subscription)
   try {
     await registerPushSubscription();
     await setupGmailWatch();
     pushActive = true;
     await chrome.storage.local.set({ pushActive: true });
-    chrome.alarms.create('gmail-poll-fallback', { periodInMinutes: 10 });
-    console.log('Push mode active — polling every 5min as fallback');
+    console.log('Push mode active — no polling');
   } catch (err) {
-    console.warn('Push setup failed, using polling:', err.message);
+    console.error('Push setup failed:', err.message);
     pushActive = false;
     await chrome.storage.local.set({ pushActive: false });
-    chrome.alarms.create('gmail-poll-fallback', { periodInMinutes: 0.5 });
   }
-
-  ensurePollLoop();
 }
 
 function stopMonitoring() {
   isMonitoring = false;
   chrome.storage.local.set({ monitoring: false });
-  chrome.alarms.clear('gmail-poll-fallback');
   chrome.alarms.clear('gmail-watch-renew');
-  if (pollTimeoutId) {
-    clearTimeout(pollTimeoutId);
-    pollTimeoutId = null;
-  }
-}
-
-function ensurePollLoop() {
-  if (pollTimeoutId) return;
-  pollLoop();
-}
-
-async function pollLoop() {
-  pollTimeoutId = null;
-  if (!isMonitoring) return;
-
-  try {
-    await checkForNewEmails();
-  } catch (err) {
-    console.error('Poll error:', err);
-  }
-
-  if (isMonitoring) {
-    pollTimeoutId = setTimeout(pollLoop, pushActive ? PUSH_POLL_FALLBACK_MS : POLL_INTERVAL_MS);
-  }
 }
 
 // --- Gmail Auth ---
