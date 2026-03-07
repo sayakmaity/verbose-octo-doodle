@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Gmail Code Clipper</h1>
+
+    <div class="section">
+      <div class="status-row">
+        <span id="status-dot" class="dot off"></span>
+        <span id="status-text">Stopped</span>
+      </div>
+      <button id="toggle-btn" class="btn">Start Monitoring</button>
+    </div>
+
+    <div class="section">
+      <label for="api-key">Gemini API Key</label>
+      <div class="key-row">
+        <input type="password" id="api-key" placeholder="AIza..." />
+        <button id="save-key" class="btn btn-sm">Save</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>Recent Codes</label>
+      <div id="history" class="history">
+        <div class="empty">No codes detected yet</div>
+      </div>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

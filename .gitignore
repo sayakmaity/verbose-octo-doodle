@@ -1,0 +1,5 @@
+.env
+node_modules/
+cloud-function/.env.yaml
+gmail-code-clipper/config.js
+gmail-code-clipper/manifest.json

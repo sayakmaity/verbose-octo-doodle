@@ -1,0 +1,10 @@
+{
+  "name": "gmail-code-clipper-cloud",
+  "version": "1.0.0",
+  "description": "Relays Gmail push notifications to Chrome extension via FCM",
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/firestore": "^7.0.0",
+    "web-push": "^3.6.7"
+  }
+}
