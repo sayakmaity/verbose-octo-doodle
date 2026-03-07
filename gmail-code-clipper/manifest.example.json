@@ -14,6 +14,7 @@
   "host_permissions": [
     "https://gmail.googleapis.com/*",
     "https://generativelanguage.googleapis.com/*",
+    "https://oauth2.googleapis.com/*",
     "https://us-central1-YOUR_PROJECT_ID.cloudfunctions.net/*"
   ],
   "background": {
@@ -32,11 +33,5 @@
     "16": "icon16.png",
     "48": "icon48.png",
     "128": "icon128.png"
-  },
-  "oauth2": {
-    "client_id": "YOUR_CLIENT_ID.apps.googleusercontent.com",
-    "scopes": [
-      "https://www.googleapis.com/auth/gmail.readonly"
-    ]
   }
 }

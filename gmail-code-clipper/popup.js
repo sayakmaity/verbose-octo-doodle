@@ -4,6 +4,8 @@ const statusText = document.getElementById('status-text');
 const apiKeyInput = document.getElementById('api-key');
 const saveKeyBtn = document.getElementById('save-key');
 const historyEl = document.getElementById('history');
+const accountsEl = document.getElementById('accounts');
+const addAccountBtn = document.getElementById('add-account');
 
 let monitoring = false;
 
@@ -17,6 +19,7 @@ chrome.runtime.sendMessage({ action: 'getStatus' }, (response) => {
   if (response) {
     monitoring = response.monitoring;
     updateUI();
+    renderAccounts(response.accounts || []);
   }
 });
 
@@ -29,6 +32,14 @@ toggleBtn.addEventListener('click', () => {
   chrome.runtime.sendMessage({ action }, () => {
     monitoring = !monitoring;
     updateUI();
+    // Refresh account list after starting
+    if (monitoring) {
+      setTimeout(() => {
+        chrome.runtime.sendMessage({ action: 'getStatus' }, (r) => {
+          if (r) renderAccounts(r.accounts || []);
+        });
+      }, 1000);
+    }
   });
 });
 
@@ -56,6 +67,55 @@ saveKeyBtn.addEventListener('click', () => {
   });
 });
 
+// --- Accounts ---
+
+addAccountBtn.addEventListener('click', () => {
+  addAccountBtn.disabled = true;
+  addAccountBtn.textContent = 'Signing in...';
+  chrome.runtime.sendMessage({ action: 'addAccount' }, (response) => {
+    addAccountBtn.disabled = false;
+    addAccountBtn.textContent = '+ Add Account';
+    if (response?.error) {
+      showToast('Error: ' + response.error);
+      return;
+    }
+    if (response?.email) {
+      showToast('Added ' + response.email);
+      chrome.runtime.sendMessage({ action: 'getStatus' }, (r) => {
+        if (r) renderAccounts(r.accounts || []);
+      });
+    }
+  });
+});
+
+function renderAccounts(emails) {
+  if (!emails.length) {
+    accountsEl.innerHTML = '<div class="empty">No accounts — click Start Monitoring to add one</div>';
+    return;
+  }
+  accountsEl.innerHTML = emails
+    .map(
+      (email) => `
+      <div class="account-item">
+        <span class="account-email">${escapeHtml(email)}</span>
+        <button class="btn-remove" data-email="${escapeHtml(email)}" title="Remove">&times;</button>
+      </div>`
+    )
+    .join('');
+
+  accountsEl.querySelectorAll('.btn-remove').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const email = btn.dataset.email;
+      chrome.runtime.sendMessage({ action: 'removeAccount', email }, () => {
+        showToast('Removed ' + email);
+        chrome.runtime.sendMessage({ action: 'getStatus' }, (r) => {
+          if (r) renderAccounts(r.accounts || []);
+        });
+      });
+    });
+  });
+}
+
 // --- History ---
 
 function loadHistory() {
@@ -74,10 +134,11 @@ function renderHistory(items) {
     .map((item) => {
       const ago = timeAgo(item.timestamp);
       const from = item.from.replace(/<.*>/, '').trim() || item.from;
+      const acct = item.email ? ` · ${item.email}` : '';
       return `
         <div class="history-item" data-code="${escapeHtml(item.code)}" title="Click to copy">
           <div class="code">${escapeHtml(item.code)}</div>
-          <div class="meta">${escapeHtml(from)} &middot; ${ago}</div>
+          <div class="meta">${escapeHtml(from)}${escapeHtml(acct)} · ${ago}</div>
         </div>`;
     })
     .join('');
