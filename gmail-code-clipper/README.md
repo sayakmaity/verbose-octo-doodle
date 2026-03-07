@@ -1,52 +1,128 @@
 # Gmail Code Clipper
 
-Chrome extension that monitors your Gmail for login/verification codes and automatically copies them to your clipboard.
+A Chrome extension that watches your Gmail for login codes and copies them to your clipboard instantly. Zero polling — uses push notifications so your laptop stays asleep until a code arrives.
 
 ## How it works
 
-1. Gmail `watch()` pushes notifications to Google Cloud Pub/Sub when new emails arrive
-2. A Cloud Function relays the notification via Web Push to the Chrome extension
-3. The extension reads the email, sends it to Gemini Flash Lite for code extraction
-4. If a code is found, it's copied to your clipboard and a notification is shown
-5. 3-second polling is used as a fallback if push setup fails
+```
+New email arrives in Gmail
+  -> Gmail API watch() pushes to Google Cloud Pub/Sub
+  -> Cloud Function sends Web Push notification to extension
+  -> Extension wakes up, reads the email via Gmail API
+  -> Gemini Flash Lite extracts the login code
+  -> Code is copied to clipboard + badge shown on extension icon
+```
 
-## Extension files
+No background polling. The extension makes zero network calls when idle. The only scheduled task is renewing the Gmail `watch()` subscription every ~6 days.
+
+## Project structure
 
 ```
-gmail-code-clipper/
-  manifest.json      Chrome extension manifest (MV3)
-  background.js      Service worker: auth, polling/push, Gmail API, Gemini, clipboard
-  offscreen.html/js  Offscreen document for clipboard writes (MV3 requirement)
-  popup.html/js/css  Extension popup: start/stop, API key config, code history
-  icon*.png          Extension icons
+gmail-code-clipper/          # Chrome extension
+  background.js              Service worker: push handler, Gmail API, Gemini, clipboard
+  config.js                  Your project-specific config (gitignored)
+  config.example.js          Template — copy to config.js and fill in values
+  manifest.json              Extension manifest (gitignored — has your OAuth client ID)
+  manifest.example.json      Template — copy to manifest.json
+  offscreen.html + .js       Offscreen document for clipboard writes (MV3 requirement)
+  popup.html + .js + .css    Popup UI: start/stop toggle, Gemini API key, code history
+  icon{16,48,128}.png        Extension icons
+
+cloud-function/              # GCP Cloud Function (push relay)
+  index.js                   Pub/Sub handler + push subscription registration endpoint
+  package.json               Dependencies: @google-cloud/firestore, web-push
+  deploy.sh                  One-command setup: APIs, Pub/Sub, Firestore, deploy
+  .env.yaml                  VAPID keys (gitignored)
 ```
 
 ## Setup
 
 ### 1. Google Cloud project
 
-1. Create a GCP project and enable the **Gmail API**
-2. Set up the **OAuth consent screen** (APIs & Services > OAuth consent screen)
-3. Create an **OAuth client ID** of type "Chrome extension" with your extension's ID
-4. Put the client ID in `manifest.json` under `oauth2.client_id`
+Create a project (or use an existing one) at [console.cloud.google.com](https://console.cloud.google.com).
 
-### 2. Gemini API key
+Enable the **Gmail API**:
+```
+gcloud services enable gmail.googleapis.com --project=YOUR_PROJECT_ID
+```
 
-Get one at [Google AI Studio](https://aistudio.google.com/apikey).
+### 2. Deploy the Cloud Function
 
-### 3. Load the extension
+```bash
+cd cloud-function
+npm install
+./deploy.sh YOUR_PROJECT_ID
+```
 
-1. Open `chrome://extensions/`, enable Developer mode
-2. Click "Load unpacked" and select the `gmail-code-clipper` folder
-3. Click the extension icon, paste your Gemini API key, click Save
-4. Click "Start Monitoring"
+This enables all required APIs (Pub/Sub, Cloud Functions, FCM, Firestore, Firebase), creates the Pub/Sub topic, grants Gmail publish access, generates VAPID keys, and deploys two Cloud Functions:
 
-The extension will prompt for Google sign-in on first use. After that, it polls Gmail every 3 seconds (or uses push if configured).
+- **gmail-push-handler** (Pub/Sub trigger) — receives Gmail notifications, sends Web Push to extension
+- **register-push** (HTTP trigger) — extension calls this to register its push subscription
 
-## Push notifications (optional)
+The script prints the config values you'll need for the extension.
 
-Push mode eliminates polling — the extension only wakes up when a new email arrives.
+### 3. OAuth consent screen
 
-See the `cloud-function/` directory for the Cloud Function that relays Gmail push notifications to the extension via Web Push. Run `deploy.sh` to set up the Pub/Sub topic and deploy the function.
+Go to **Google Auth Platform** in the Cloud Console:
 
-The extension automatically attempts to enable push on "Start Monitoring". If the Cloud Function isn't deployed, it falls back to polling.
+1. Configure **Branding** (app name, support email)
+2. Under **Audience**, add your Gmail address as a test user
+3. Under **Clients**, create a **Chrome extension** client with your extension's Item ID
+
+You'll get the extension ID after loading it in step 5.
+
+### 4. Configure the extension
+
+```bash
+cd gmail-code-clipper
+cp config.example.js config.js
+cp manifest.example.json manifest.json
+```
+
+Fill in `config.js` with the values printed by `deploy.sh`:
+```js
+const CONFIG = {
+  GCP_TOPIC_NAME: 'projects/YOUR_PROJECT_ID/topics/gmail-code-push',
+  VAPID_PUBLIC_KEY: '...',          // from deploy.sh output
+  REGISTER_PUSH_URL: '...',        // from deploy.sh output
+  OAUTH_CLIENT_ID: '...',          // from Cloud Console OAuth client
+};
+```
+
+Fill in `manifest.json`:
+- Set `oauth2.client_id` to your Chrome extension OAuth client ID
+- Set your Cloud Function URL in `host_permissions`
+
+### 5. Load the extension
+
+1. Open `chrome://extensions/`
+2. Enable **Developer mode**
+3. Click **Load unpacked**, select the `gmail-code-clipper` folder
+4. Note the **extension ID** — go back to step 3 and enter it as the Item ID if you haven't
+
+### 6. Start it
+
+1. Click the extension icon in the toolbar
+2. Paste your **Gemini API key** ([get one here](https://aistudio.google.com/apikey)) and click Save
+3. Click **Start Monitoring**
+4. Sign in with Google when prompted
+
+The extension will set up Gmail `watch()` and register for push notifications. When a login code email arrives, it's automatically copied to your clipboard and the code appears as a badge on the extension icon.
+
+## Sharing with friends
+
+Add their Gmail addresses as test users in the OAuth consent screen. Share the extension folder with your `config.js` and `manifest.json` included. They just need to:
+
+1. Load the unpacked extension
+2. Enter their own Gemini API key
+3. Click Start Monitoring
+
+For wider distribution, you'd need to publish to the Chrome Web Store and go through Google's OAuth verification process (since `gmail.readonly` is a sensitive scope).
+
+## Cost
+
+The extension itself is free to run. The only cost is Gemini API usage:
+
+- ~$0.05/user/month (Gemini Flash Lite, ~100 emails/day)
+- Free tier: 1,500 requests/day
+- GCP infrastructure: effectively $0 (free tier covers Pub/Sub, Cloud Functions, Firestore)
