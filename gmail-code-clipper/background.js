@@ -4,15 +4,12 @@ const VAPID_PUBLIC_KEY = CONFIG.VAPID_PUBLIC_KEY;
 const REGISTER_PUSH_URL = CONFIG.REGISTER_PUSH_URL;
 const OAUTH_CLIENT_ID = CONFIG.OAUTH_CLIENT_ID;
 const OAUTH_CLIENT_SECRET = CONFIG.OAUTH_CLIENT_SECRET;
-const POLL_INTERVAL_MS = 3000;
-const PUSH_POLL_FALLBACK_MS = 5 * 60 * 1000;
 const MAX_PROCESSED_CACHE = 200;
 
 // --- State ---
 // accounts: { [email]: { accessToken, refreshToken, lastHistoryId, expiresAt } }
 let accounts = {};
 let isMonitoring = false;
-let pollTimeoutId = null;
 let processedMessageIds = new Set();
 let pushActive = false;
 
@@ -22,7 +19,6 @@ chrome.runtime.onInstalled.addListener(() => restoreAndStart());
 chrome.runtime.onStartup.addListener(() => restoreAndStart());
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'gmail-poll-fallback') restoreAndStart();
   if (alarm.name === 'gmail-watch-renew') setupAllWatches().catch(console.error);
 });
 
@@ -41,11 +37,12 @@ async function restoreAndStart() {
     }
   }
 
-  if (pushActive) await reregisterPushSubscription();
-
   if (stored.monitoring) {
     isMonitoring = true;
-    ensurePollLoop();
+    if (pushActive) {
+      await reregisterPushSubscription();
+      setupAllWatches().catch((err) => console.warn('Watch renewal on startup failed:', err.message));
+    }
   }
 }
 
@@ -104,7 +101,6 @@ async function launchOAuthFlow() {
   const code = new URL(responseUrl).searchParams.get('code');
   if (!code) throw new Error('No auth code in response');
 
-  // Exchange code for tokens
   const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -273,7 +269,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function addAccount() {
   const tokenData = await launchOAuthFlow();
 
-  // Get the email for this account
   const profileResp = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
     headers: { Authorization: `Bearer ${tokenData.access_token}` },
   });
@@ -282,7 +277,6 @@ async function addAccount() {
   const email = profile.emailAddress;
 
   if (accounts[email]) {
-    // Update existing account tokens
     accounts[email].accessToken = tokenData.access_token;
     accounts[email].refreshToken = tokenData.refresh_token || accounts[email].refreshToken;
     accounts[email].expiresAt = Date.now() + tokenData.expires_in * 1000;
@@ -325,7 +319,6 @@ async function startMonitoring() {
       console.error('Failed to add initial account:', err);
     }
   } else {
-    // Refresh tokens for existing accounts
     for (const email of Object.keys(accounts)) {
       try {
         const token = await getTokenForAccount(email);
@@ -340,46 +333,24 @@ async function startMonitoring() {
 
   console.log('Monitoring:', Object.keys(accounts).join(', '));
 
+  // Enable push (watch + subscription)
   try {
     await registerPushSubscription();
     await setupAllWatches();
     pushActive = true;
     await chrome.storage.local.set({ pushActive: true });
-    chrome.alarms.create('gmail-poll-fallback', { periodInMinutes: 10 });
+    console.log('Push mode active — no polling');
   } catch (err) {
-    console.warn('Push setup failed, using polling:', err.message);
+    console.error('Push setup failed:', err.message);
     pushActive = false;
     await chrome.storage.local.set({ pushActive: false });
-    chrome.alarms.create('gmail-poll-fallback', { periodInMinutes: 0.5 });
   }
-
-  ensurePollLoop();
 }
 
 function stopMonitoring() {
   isMonitoring = false;
   chrome.storage.local.set({ monitoring: false });
-  chrome.alarms.clear('gmail-poll-fallback');
   chrome.alarms.clear('gmail-watch-renew');
-  if (pollTimeoutId) { clearTimeout(pollTimeoutId); pollTimeoutId = null; }
-}
-
-function ensurePollLoop() {
-  if (pollTimeoutId) return;
-  pollLoop();
-}
-
-async function pollLoop() {
-  pollTimeoutId = null;
-  if (!isMonitoring) return;
-
-  try { await checkAllAccountsForNewEmails(); } catch (err) {
-    console.error('Poll error:', err);
-  }
-
-  if (isMonitoring) {
-    pollTimeoutId = setTimeout(pollLoop, pushActive ? PUSH_POLL_FALLBACK_MS : POLL_INTERVAL_MS);
-  }
 }
 
 // --- Gmail API ---
