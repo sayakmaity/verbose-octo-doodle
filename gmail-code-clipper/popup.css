@@ -107,6 +107,49 @@ h1 {
   font-family: monospace;
 }
 
+.account-list {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+}
+
+.account-list .empty {
+  padding: 8px 10px;
+  color: #999;
+  font-style: italic;
+  font-size: 12px;
+}
+
+.account-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.account-item:last-child {
+  border-bottom: none;
+}
+
+.account-email {
+  font-size: 12px;
+  color: #333;
+}
+
+.btn-remove {
+  background: none;
+  border: none;
+  color: #999;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.btn-remove:hover {
+  color: #ef4444;
+}
+
 .history {
   max-height: 180px;
   overflow-y: auto;
