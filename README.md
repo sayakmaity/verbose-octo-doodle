@@ -109,15 +109,11 @@ Fill in `manifest.json`:
 
 The extension will set up Gmail `watch()` and register for push notifications. When a login code email arrives, it's automatically copied to your clipboard and the code appears as a badge on the extension icon.
 
-## Sharing with friends
+## Self-hosting your own instance
 
-Add their Gmail addresses as test users in the OAuth consent screen. Share the extension folder with your `config.js` and `manifest.json` included. They just need to:
+Everything in this repo is designed to run on your own GCP project. Follow steps 1–6 above and you'll have your own fully independent instance — your own OAuth client, your own Cloud Functions, your own Pub/Sub topic. Nothing is shared with anyone else.
 
-1. Load the unpacked extension
-2. Enter their own Gemini API key
-3. Click Start Monitoring
-
-For wider distribution, you'd need to publish to the Chrome Web Store and go through Google's OAuth verification process (since `gmail.readonly` is a sensitive scope).
+The whole setup takes about 15 minutes and costs effectively $0 (GCP free tier covers all infrastructure; Gemini free tier gives 1,500 requests/day).
 
 ## Cost
 
