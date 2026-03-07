@@ -143,8 +143,16 @@ The whole setup takes about 15 minutes and costs effectively $0 (GCP free tier c
 
 ## Cost
 
-The extension itself is free to run. The only cost is Gemini API usage:
+**For a single user: $0.** Everything fits within free tiers.
 
-- ~$0.05/user/month (Gemini Flash Lite, ~100 emails/day)
-- Free tier: 1,500 requests/day
-- GCP infrastructure: effectively $0 (free tier covers Pub/Sub, Cloud Functions, Firestore)
+- **Gemini API**: free tier gives 1,500 requests/day (a typical inbox gets ~100 emails/day)
+- **GCP infrastructure**: free tier covers ~700K emails/month — a single user uses ~0.4% of that
+
+**At scale**, the bottleneck is Cloud Functions compute at ~700K emails/month (~230 users at 100 emails/day). Beyond that, costs are minimal:
+
+| Component | Free tier limit | Cost beyond free tier |
+|---|---|---|
+| Cloud Functions | ~700K invocations/mo | ~$0.40 per additional 1M |
+| Firestore reads | 50K/day | ~$0.06 per 100K |
+| Pub/Sub | 10 GB/mo | ~$0.04 per GB |
+| Gemini Flash Lite | 1,500 req/day | ~$0.05/user/month |
