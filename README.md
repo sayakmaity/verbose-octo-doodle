@@ -93,25 +93,31 @@ You'll get the extension ID after loading it in step 5.
 
 ### 4. Configure the extension
 
+Two files are gitignored because they contain project-specific secrets. You need to create them from the provided templates:
+
 ```bash
 cd gmail-code-clipper
 cp config.example.js config.js
 cp manifest.example.json manifest.json
 ```
 
-Fill in `config.js` with the values printed by `deploy.sh`:
-```js
-const CONFIG = {
-  GCP_TOPIC_NAME: 'projects/YOUR_PROJECT_ID/topics/gmail-code-push',
-  VAPID_PUBLIC_KEY: '...',          // from deploy.sh output
-  REGISTER_PUSH_URL: '...',        // from deploy.sh output
-  OAUTH_CLIENT_ID: '...',          // from Cloud Console OAuth client
-};
-```
+**`config.js`** — fill in these values:
 
-Fill in `manifest.json`:
-- Set `oauth2.client_id` to your Chrome extension OAuth client ID
-- Set your Cloud Function URL in `host_permissions`
+| Field | Where to get it |
+|---|---|
+| `GCP_TOPIC_NAME` | `projects/YOUR_PROJECT_ID/topics/gmail-code-push` (your GCP project ID) |
+| `VAPID_PUBLIC_KEY` | Printed by `deploy.sh` when you deployed the Cloud Function |
+| `REGISTER_PUSH_URL` | Printed by `deploy.sh` (looks like `https://register-push-xxxxx-uc.a.run.app`) |
+| `OAUTH_CLIENT_ID` | From the Chrome extension OAuth client you created in step 3 |
+
+**`manifest.json`** — fill in these values:
+
+| Field | Where to get it |
+|---|---|
+| `oauth2.client_id` | Same Chrome extension OAuth client ID as above |
+| `host_permissions` (3rd entry) | Replace `YOUR_PROJECT_ID` with your GCP project ID |
+
+**`.env.yaml`** (in `cloud-function/`) is also gitignored — `deploy.sh` generates this automatically with your VAPID keys.
 
 ### 5. Load the extension
 
