@@ -20,16 +20,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 async function restoreAndStart() {
-  const stored = await chrome.storage.local.get(['monitoring', 'lastHistoryId', 'pushActive']);
+  const stored = await chrome.storage.local.get(['lastHistoryId', 'pushActive']);
   lastHistoryId = stored.lastHistoryId || null;
   pushActive = !!stored.pushActive;
 
-  if (stored.monitoring) {
+  // Always monitor if push was previously set up
+  if (pushActive) {
     isMonitoring = true;
-    if (pushActive) {
-      await reregisterPushSubscription();
-      setupGmailWatch().catch((err) => console.warn('Watch renewal on startup failed:', err.message));
-    }
+    await reregisterPushSubscription();
+    setupGmailWatch().catch((err) => console.warn('Watch renewal on startup failed:', err.message));
   }
 }
 
@@ -123,10 +122,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     startMonitoring().then(() => sendResponse({ success: true }));
     return true;
   }
-  if (message.action === 'stopMonitoring') {
-    stopMonitoring();
-    sendResponse({ success: true });
-  }
   if (message.action === 'getStatus') {
     sendResponse({ monitoring: isMonitoring, pushActive });
   }
@@ -137,7 +132,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function startMonitoring() {
   isMonitoring = true;
-  await chrome.storage.local.set({ monitoring: true });
 
   try {
     const token = await getAuthToken();
@@ -163,11 +157,7 @@ async function startMonitoring() {
   }
 }
 
-function stopMonitoring() {
-  isMonitoring = false;
-  chrome.storage.local.set({ monitoring: false });
-  chrome.alarms.clear('gmail-watch-renew');
-}
+// No stopMonitoring — once set up, monitoring is always on
 
 // --- Gmail Auth ---
 

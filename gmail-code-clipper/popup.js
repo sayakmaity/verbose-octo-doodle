@@ -1,11 +1,9 @@
-const toggleBtn = document.getElementById('toggle-btn');
+const setupBtn = document.getElementById('setup-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const apiKeyInput = document.getElementById('api-key');
 const saveKeyBtn = document.getElementById('save-key');
 const historyEl = document.getElementById('history');
-
-let monitoring = false;
 
 // --- Init ---
 
@@ -14,35 +12,39 @@ chrome.storage.local.get(['geminiApiKey'], (stored) => {
 });
 
 chrome.runtime.sendMessage({ action: 'getStatus' }, (response) => {
-  if (response) {
-    monitoring = response.monitoring;
-    updateUI();
-  }
+  if (response) updateUI(response.monitoring, response.pushActive);
 });
 
 loadHistory();
 
-// --- Toggle monitoring ---
+// --- Setup ---
 
-toggleBtn.addEventListener('click', () => {
-  const action = monitoring ? 'stopMonitoring' : 'startMonitoring';
-  chrome.runtime.sendMessage({ action }, () => {
-    monitoring = !monitoring;
-    updateUI();
+setupBtn.addEventListener('click', () => {
+  setupBtn.disabled = true;
+  setupBtn.textContent = 'Setting up...';
+  chrome.runtime.sendMessage({ action: 'startMonitoring' }, () => {
+    chrome.runtime.sendMessage({ action: 'getStatus' }, (response) => {
+      if (response) updateUI(response.monitoring, response.pushActive);
+      setupBtn.disabled = false;
+    });
   });
 });
 
-function updateUI() {
-  if (monitoring) {
+function updateUI(monitoring, pushActive) {
+  if (monitoring && pushActive) {
     statusDot.className = 'dot on';
-    statusText.textContent = 'Monitoring';
-    toggleBtn.textContent = 'Stop';
-    toggleBtn.classList.add('active');
+    statusText.textContent = 'Active';
+    setupBtn.style.display = 'none';
+  } else if (monitoring) {
+    statusDot.className = 'dot warn';
+    statusText.textContent = 'Active (push failed — restart Chrome)';
+    setupBtn.textContent = 'Retry Setup';
+    setupBtn.style.display = '';
   } else {
     statusDot.className = 'dot off';
-    statusText.textContent = 'Stopped';
-    toggleBtn.textContent = 'Start Monitoring';
-    toggleBtn.classList.remove('active');
+    statusText.textContent = 'Not set up';
+    setupBtn.textContent = 'Set Up Monitoring';
+    setupBtn.style.display = '';
   }
 }
 

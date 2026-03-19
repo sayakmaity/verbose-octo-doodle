@@ -59,6 +59,11 @@ h1 {
   background: #aaa;
 }
 
+.dot.warn {
+  background: #f59e0b;
+  box-shadow: 0 0 6px #f59e0b80;
+}
+
 #status-text {
   font-weight: 500;
 }
