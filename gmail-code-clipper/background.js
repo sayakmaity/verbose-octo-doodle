@@ -9,24 +9,38 @@ let lastHistoryId = null;
 let isMonitoring = false;
 let processedMessageIds = new Set();
 let pushActive = false;
+let stateRestored = false;
 
 // --- Lifecycle ---
 
-chrome.runtime.onInstalled.addListener(() => restoreAndStart());
-chrome.runtime.onStartup.addListener(() => restoreAndStart());
-
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'gmail-watch-renew') setupGmailWatch().catch(console.error);
-});
-
-async function restoreAndStart() {
+// Restore state on EVERY service worker start (not just onInstalled/onStartup).
+// This is critical because Chrome can terminate and restart the service worker
+// at any time (e.g. when a push arrives after 5min of inactivity).
+async function restoreState() {
+  if (stateRestored) return;
   const stored = await chrome.storage.local.get(['lastHistoryId', 'pushActive']);
   lastHistoryId = stored.lastHistoryId || null;
   pushActive = !!stored.pushActive;
+  if (pushActive) isMonitoring = true;
+  stateRestored = true;
+}
 
-  // Always monitor if push was previously set up
+// Quick restore runs immediately on every service worker start
+restoreState();
+
+// Full restore with re-registration runs on Chrome start/install
+chrome.runtime.onInstalled.addListener(() => fullRestore());
+chrome.runtime.onStartup.addListener(() => fullRestore());
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'gmail-watch-renew') {
+    restoreState().then(() => setupGmailWatch().catch(console.error));
+  }
+});
+
+async function fullRestore() {
+  await restoreState();
   if (pushActive) {
-    isMonitoring = true;
     await reregisterPushSubscription();
     setupGmailWatch().catch((err) => console.warn('Watch renewal on startup failed:', err.message));
   }
@@ -35,11 +49,14 @@ async function restoreAndStart() {
 // --- Web Push ---
 
 self.addEventListener('push', (event) => {
-  const data = event.data?.json();
-  console.log('Push received:', data);
-  if (data?.type === 'gmail_update') {
-    event.waitUntil(checkForNewEmails());
-  }
+  event.waitUntil((async () => {
+    await restoreState();
+    const data = event.data?.json();
+    console.log('Push received:', data);
+    if (data?.type === 'gmail_update') {
+      await checkForNewEmails();
+    }
+  })());
 });
 
 function urlBase64ToUint8Array(base64String) {
