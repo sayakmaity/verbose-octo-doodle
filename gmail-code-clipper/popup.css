@@ -4,6 +4,12 @@
   box-sizing: border-box;
 }
 
+/* Author rules like .btn { display: inline-block } beat the browser's own
+   [hidden] rule; keep the hidden attribute authoritative. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   width: 320px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -83,33 +89,21 @@ h1 {
   background: #e5e7eb;
 }
 
-.btn.active {
-  background: #ef4444;
-  color: #fff;
-  border-color: #ef4444;
-}
-
-.btn.active:hover {
-  background: #dc2626;
-}
-
-.btn-sm {
-  padding: 4px 10px;
-  font-size: 12px;
-}
-
-.key-row {
+.btn-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
-.key-row input {
-  flex: 1;
-  padding: 5px 8px;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  font-size: 13px;
-  font-family: monospace;
+.btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.note {
+  font-size: 11px;
+  color: #666;
+  margin: -2px 0 8px 18px;
 }
 
 .history {
