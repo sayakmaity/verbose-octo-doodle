@@ -14,3 +14,9 @@
 .gitignore
 
 node_modules
+
+# Secrets and dev-only files never go in the function source upload.
+# (gcloud reads --env-vars-file locally; it does not need to be uploaded.)
+.env.yaml*
+deploy.sh
+test/
