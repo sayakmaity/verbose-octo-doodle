@@ -143,9 +143,8 @@ VAPID_PRIVATE_KEY: "$VAPID_PRIVATE"
 ALLOWED_EMAILS: "$ALLOWED_EMAILS"
 EOF
 
-# register-push first: the new handler only delivers to subscriptions
-# registered through it (plus the legacy config/push fallback), so the
-# registration endpoint must be live before the handler switches over.
+# register-push first: the handler only delivers to subscriptions registered
+# through it, so the registration endpoint must be live before the handler.
 echo "==> Deploying register-push (HTTP triggered)..."
 gcloud functions deploy register-push \
   --gen2 \

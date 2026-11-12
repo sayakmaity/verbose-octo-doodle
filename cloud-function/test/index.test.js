@@ -141,17 +141,6 @@ for (const [token, status] of [[null, 401], ['forged', 401], ['google-down', 502
   });
 }
 
-test('legacy config/push subscription still gets pushes until the extension re-registers', async () => {
-  state.docs['config/push'] = { subscription: sub('https://push.example/legacy') };
-  await notify(7);
-  assert.deepStrictEqual(sentEndpoints(), ['https://push.example/legacy']);
-  // Once a new-style registration exists, the legacy doc is no longer used.
-  state.sent = [];
-  await register(sub('https://push.example/new'));
-  await notify(8);
-  assert.deepStrictEqual(sentEndpoints(), ['https://push.example/new']);
-});
-
 test('registerPush fails closed when ALLOWED_EMAILS is unset', async () => {
   const saved = process.env.ALLOWED_EMAILS;
   delete process.env.ALLOWED_EMAILS;

@@ -152,14 +152,6 @@ The extension will set up Gmail `watch()` and register for push notifications. W
 
 **Note on re-authorization:** because the OAuth app runs in "Testing" status (required for the restricted Gmail scope without a security audit), Google expires the consent grant every 7 days. When that happens the extension shows a "needs re-authorization" notification — click it (or open the popup and hit Re-authorize) to sign in again. Monitoring resumes and the backlog is drained, but codes older than 15 minutes are skipped as expired rather than copied.
 
-### Upgrading an existing install (per-account push + authenticated register-push)
-
-The server now only accepts push registrations that carry the extension's Google token, and stores them per account and device. Cut over in this order:
-
-1. `cd cloud-function && ./deploy.sh YOUR_PROJECT_ID you@gmail.com`. If the local `.env.yaml` has no valid VAPID keys, the script restores them from the deployed function instead of deploying placeholders. It deploys `register-push` first.
-2. **Right away**, reload the extension in `chrome://extensions`. On reload it re-registers with its token. Until then, the server keeps delivering to the old `config/push` subscription, so nothing is dropped during the switch.
-3. Check the Firestore `pushSubscriptions` collection: there should be a document for your account. After that, the old `config/push` document can be deleted.
-
 ## Self-hosting your own instance
 
 Everything in this repo is designed to run on your own GCP project. Follow steps 1–6 above and you'll have your own fully independent instance — your own OAuth client, your own Cloud Functions, your own Pub/Sub topic. Nothing is shared with anyone else.
