@@ -2,6 +2,7 @@
 // Run: node gmail-code-clipper/test/background.test.js
 'use strict';
 const assert = require('assert');
+const { test } = require('node:test');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
@@ -20,7 +21,7 @@ function mockLanguageModel({
 } = {}) {
   const lm = {
     availabilityValue: availability, failPrompts, hang,
-    created: 0, clones: 0, destroyed: 0, prompts: [], promptOpts: [], createOpts: [],
+    created: 0, destroyed: 0, prompts: [], promptOpts: [], createOpts: [],
     availability: async () => lm.availabilityValue,
     create: async (opts) => { lm.created++; lm.createOpts.push(opts); return session(); },
   };
@@ -28,7 +29,6 @@ function mockLanguageModel({
     return {
       contextWindow, contextUsage: 0,
       measureContextUsage: async (text) => measure(text),
-      clone: async () => { lm.clones++; return session(); },
       destroy: () => { lm.destroyed++; },
       prompt: (text, opts) => {
         lm.prompts.push(text);
@@ -89,12 +89,12 @@ function makeEnv(initialStorage = {}, opts = {}) {
   const storage = { ...initialStorage };
   const alarms = {};
   const notifications = [];
-  const listeners = { push: [], pushsubscriptionchange: [], message: [], alarm: [], storageChanged: [], installed: [], startup: [] };
+  const listeners = { push: [], pushsubscriptionchange: [], message: [], alarm: [], storageChanged: [], installed: [], startup: [], notificationClicked: [] };
   let fetchHandler = () => { throw new Error('fetch not stubbed'); };
   const fetchLog = [];
 
   const env = {
-    storage, alarms, notifications, listeners, fetchLog, sentMessages: [], storageRemoves: 0,
+    storage, alarms, notifications, listeners, fetchLog, sentMessages: [],
     // true: the offscreen document never answers nano-* messages (model host unreachable).
     offscreenDown: false,
     setFetch(fn) { fetchHandler = fn; },
@@ -120,7 +120,6 @@ function makeEnv(initialStorage = {}, opts = {}) {
           for (const fn of listeners.storageChanged) fn(changes, 'local');
         },
         remove: async (keys) => {
-          env.storageRemoves++;
           if (typeof keys === 'string') keys = [keys];
           const changes = {};
           for (const k of keys) if (k in storage) { changes[k] = { oldValue: storage[k] }; delete storage[k]; }
@@ -162,7 +161,7 @@ function makeEnv(initialStorage = {}, opts = {}) {
     notifications: {
       create: (id, opts) => notifications.push({ id, opts }),
       clear: () => {},
-      onClicked: { addListener: () => {} },
+      onClicked: { addListener: (fn) => listeners.notificationClicked.push(fn) },
     },
     action: {
       setBadgeText: (o) => { env.badge = o.text; },
@@ -270,24 +269,67 @@ async function firePush(env) {
   await done;
 }
 
-const tests = [];
-function test(name, fn) { tests.push([name, fn]); }
+// Routes a push's Gmail fetches. History lists `history` (default: every id in
+// `messages`) as messagesAdded; pass `history: []` to test draining the
+// persisted queue. /messages/<id>? serves messages[id]: a body string (wrapped
+// with gmailMessage and `subject`) or a full message. `routes` ({ urlPart: fn })
+// are tried first. Anything else throws (e.g. a cloud model).
+function mailFetch(env, { messages = {}, history = Object.keys(messages), historyId = '200', subject, routes = {}, headers } = {}) {
+  env.setFetch(async (url, init) => {
+    url = String(url);
+    for (const [part, fn] of Object.entries(routes)) if (url.includes(part)) return fn(url, init);
+    if (url.includes('/history?')) {
+      const added = history.length ? [{ messagesAdded: history.map((id) => ({ message: { id } })) }] : [];
+      return jsonResponse({ historyId, history: added }, 200, headers);
+    }
+    const id = /\/messages\/([^/?]+)\?/.exec(url)?.[1];
+    if (id && Object.hasOwn(messages, id)) {
+      const m = messages[id];
+      return jsonResponse(typeof m === 'string' ? gmailMessage(id, m, subject) : m, 200, headers);
+    }
+    throw new Error('unexpected fetch: ' + url);
+  });
+}
+
+// The one cloud model host this extension must never call.
+const isCloudModelUrl = (u) => /generativelanguage\.googleapis\.com/.test(String(u));
+const cloudFetches = (env) => env.fetchLog.filter(isCloudModelUrl).length;
+
+// Everything startMonitoring fetches: profile, register-push, watch.
+const monitoringRoutes = {
+  '/profile': () => jsonResponse({ historyId: '77' }),
+  'https://register.example/': () => jsonResponse({ success: true }),
+  '/watch': () => jsonResponse({ historyId: '77', expiration: String(Date.now() + 7 * 86400000) }),
+};
+
+// Every getAuthToken call fails with `message` (Chrome's lastError).
+function denyAuth(env, message) {
+  env.sandbox.chrome.identity.getAuthToken = (opts, cb) => {
+    env.sandbox.chrome.runtime.lastError = { message };
+    cb(undefined);
+    env.sandbox.chrome.runtime.lastError = null;
+  };
+}
+
+// One background.js instance for the pure functions (extractBody,
+// looksLikeCodeEmail, isPlausibleCode), which read and write no module state.
+const pure = makeEnv().sandbox;
+// Gmail payload builders: a text part (optionally with a declared charset), a
+// multipart part, and extractBody over a payload.
+const textPart = (mimeType, data, charset) => ({
+  mimeType,
+  ...(charset && { headers: [{ name: 'Content-Type', value: `${mimeType}; charset="${charset}"` }] }),
+  body: { data: b64url(data) },
+});
+const plain = (s, charset) => textPart('text/plain', s, charset);
+const html = (s) => textPart('text/html', s);
+const multi = (mimeType, ...parts) => ({ mimeType, parts });
+const extract = (payload) => pure.extractBody({ payload });
 
 // --- Tests ---
 
 test('extractBody puts text/plain before the HTML rendering and decodes UTF-8', async () => {
-  const env = makeEnv();
-  const extractBody = env.sandbox.extractBody;
-  const msg = {
-    payload: {
-      mimeType: 'multipart/alternative',
-      parts: [
-        { mimeType: 'text/html', body: { data: b64url('<b>HTML wins?</b>') } },
-        { mimeType: 'text/plain', body: { data: b64url('código: 123456 ✓') } },
-      ],
-    },
-  };
-  const body = extractBody(msg);
+  const body = extract(multi('multipart/alternative', html('<b>HTML wins?</b>'), plain('código: 123456 ✓')));
   assert.ok(body.includes('código: 123456 ✓'), `got: ${body}`);
   // Plain first, HTML rendering appended (stub plain parts can't be detected reliably).
   assert.ok(body.indexOf('código') < body.indexOf('HTML wins?'), `plain should come first: ${body}`);
@@ -295,27 +337,19 @@ test('extractBody puts text/plain before the HTML rendering and decodes UTF-8', 
 });
 
 test('extractBody falls back to HTML-only email and strips tags', async () => {
-  const env = makeEnv();
-  const msg = {
-    payload: {
-      mimeType: 'multipart/mixed',
-      parts: [{ mimeType: 'text/html', body: { data: b64url('<div>Your code is <b>987654</b></div>') } }],
-    },
-  };
-  const body = env.sandbox.extractBody(msg);
+  const body = extract(multi('multipart/mixed', html('<div>Your code is <b>987654</b></div>')));
   assert.ok(body.includes('Your code is'), `got: ${body}`);
   assert.ok(body.includes('987654'));
   assert.ok(!body.includes('<b>'));
 });
 
 test('extractBody drops Outlook conditionals, <head>/<style> and preheader padding; code past the old 3000-char cut survives', async () => {
-  const env = makeEnv();
   const css = '.x { color: #333; font-size: 100%; } '.repeat(400); // ~15K chars, like big retail newsletters
-  const html = `<!DOCTYPE html><html><head><!--[if gte mso 9]><xml><o:OfficeDocumentSettings>`
+  const page = `<!DOCTYPE html><html><head><!--[if gte mso 9]><xml><o:OfficeDocumentSettings>`
     + `<o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml><![endif]-->`
     + `<style>${css}</style></head><body><div>͏ ­ ​</div>`
     + `<p>Here's your passcode!</p><p>${'filler text '.repeat(400)}</p><td>975310</td></body></html>`;
-  const body = env.sandbox.extractBody({ payload: { mimeType: 'text/html', body: { data: b64url(html) } } });
+  const body = extract(html(page));
   assert.ok(!/\b96\b/.test(body), `Outlook PixelsPerInch leaked: ${body.slice(0, 80)}`);
   assert.ok(!body.includes('font-size'), 'CSS leaked into body');
   assert.ok(!/[͏­​]/.test(body), 'invisible padding leaked');
@@ -324,20 +358,8 @@ test('extractBody drops Outlook conditionals, <head>/<style> and preheader paddi
 });
 
 test('extractBody handles deeply nested multipart', async () => {
-  const env = makeEnv();
-  const msg = {
-    payload: {
-      mimeType: 'multipart/mixed',
-      parts: [{
-        mimeType: 'multipart/alternative',
-        parts: [
-          { mimeType: 'text/plain', body: { data: b64url('nested plain 555') } },
-          { mimeType: 'text/html', body: { data: b64url('<p>nested html</p>') } },
-        ],
-      }],
-    },
-  };
-  assert.ok(env.sandbox.extractBody(msg).includes('nested plain 555'));
+  const msg = multi('multipart/mixed', multi('multipart/alternative', plain('nested plain 555'), html('<p>nested html</p>')));
+  assert.ok(extract(msg).includes('nested plain 555'));
 });
 
 test('history pagination: drains all pages before advancing cursor', async () => {
@@ -370,11 +392,7 @@ test('history pagination: drains all pages before advancing cursor', async () =>
 
 test('cursor never moves backwards', async () => {
   const env = makeEnv({ lastHistoryId: '500', pushActive: true });
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '400', history: [] }); // stale response
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { historyId: '400' }); // stale response
   await firePush(env);
   assert.strictEqual(env.storage.lastHistoryId, '500', 'cursor must not regress');
 });
@@ -384,14 +402,7 @@ test('processing failure keeps message queued (cursor already advanced is OK)', 
   const lm = mockLanguageModel({ respond: () => '424242' });
   const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { offscreenLanguageModel: lm });
   env.offscreenDown = true;
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) {
-      return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'mfail' } }] }] });
-    }
-    if (url.includes('/messages/mfail')) return jsonResponse(gmailMessage('mfail', 'your code is 424242'));
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { messages: { mfail: 'your code is 424242' } });
   await firePush(env);
   assert.deepStrictEqual([...env.storage.pendingMessageIds], ['mfail'], 'failed message stays queued');
   assert.strictEqual(env.storage.lastHistoryId, '200');
@@ -399,12 +410,7 @@ test('processing failure keeps message queued (cursor already advanced is OK)', 
 
   // Next push: the host answers again — message gets processed from the queue.
   env.offscreenDown = false;
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '201', history: [] });
-    if (url.includes('/messages/mfail')) return jsonResponse(gmailMessage('mfail', 'your code is 424242'));
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { messages: { mfail: 'your code is 424242' }, history: [], historyId: '201' });
   await firePush(env);
   assert.deepStrictEqual([...env.storage.pendingMessageIds], [], 'queue drained');
   assert.strictEqual(env.clipboard, '424242', 'code copied on retry');
@@ -439,84 +445,80 @@ test('null cursor path recovers triggering email via recent messages', async () 
   assert.strictEqual(env.storage.lastHistoryId, '50');
 });
 
-// detectCodeWithNano against a model that answers `answer.value`.
-function nanoDetector(answer) {
-  const env = makeEnv({}, { LanguageModel: mockLanguageModel({ respond: () => answer.value }) });
-  return (subject, from, body) => env.sandbox.detectCodeWithNano(subject, from, body);
+// Shape + whole-token grounding. Each row: [code, subject, body, accepted, label].
+const JWT = 'eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.sig';
+const P20 = 'abcdefghijklmnopqrst';
+// {"alg":"HS256"} encodes to exactly 20 chars, so Nano's cap lands on the '.'.
+const HS = 'eyJhbGciOiJIUzI1NiJ9';
+const JUNK_BODY = 'None of your orders shipped. null true ---- 2025 SAVE20';
+for (const [code, subject, body, accepted, label] of [
+  ['Save 20% on your next order!', 's', 'b', false, 'long junk'],
+  ['', 's', 'b', false, 'empty answer'],
+  ['123456', 's', 'Your code is 123 456', true, 'grounded, spacing ignored'],
+  ['None', 's', JUNK_BODY, false, 'placeholder None'],
+  ['null', 's', JUNK_BODY, false, 'placeholder null'],
+  ['true', 's', JUNK_BODY, false, 'placeholder true'],
+  ['----', 's', JUNK_BODY, false, 'no alphanumerics'],
+  ['482913', 'Your code', 'Thanks for shopping!', false, 'hallucinated code'],
+  ['482913', 'Your code is 482-913', 'x', true, 'code found in subject'],
+  ['abcdefghijklmnop', 's', 'Your app password: abcd efgh ijkl mnop', true, '16-char app password'],
+  ['123456', 's', 'Your code: 123‑456', true, 'non-breaking hyphen'],
+  ['123456', 's', 'Your code: 123–456', true, 'en dash'],
+  ['123456', 's', 'Your code: 123·456', true, 'middot'],
+  ['123456', 's', 'Your code: 123.456', true, 'dot'],
+  ['123456', 's', 'Your code: 123 456', true, 'space'],
+  ['eyJhbGciOiJIUzUxMiIs', 'Sign in to Acme', `Click https://acme.com/magic?t=${JWT} to sign in`, false, '20-char prefix of a JWT'],
+  ['123456', 's', 'Order 91234567 shipped', false, 'digits inside a longer number'],
+  ['ABC123', 's', 'ref XABC123', false, 'glued to a preceding letter'],
+  ['abc123', 's', 'Your code: ABC123.', true, 'case-insensitive, trailing dot ok'],
+  ['123456', 's', 'code (123-456)', true, 'parenthesized and dashed'],
+  ['123456', 's', 'code 12_3456', false, 'underscore is not a grouping separator'],
+  [P20, '', `token=${P20}_uvwxyz123`, false, 'capped prefix, underscore continuation'],
+  [P20, '', `token=${P20}-uvwxyz123`, false, 'capped prefix, dash continuation'],
+  [HS, 'Sign in to Acme', `https://acme.com/magic?token=${HS}.eyJzdWIiOiIxIn0.c2ln`, false, '20-char JWT header segment'],
+  ['123456', 's', 'x_123456', false, 'underscore before'],
+  ['123456', 's', 'Your code is 123456.', true, 'sentence-final dot'],
+  ['123456', 's', 'Your code is 123456. It expires soon', true, 'dot then more text'],
+  ['123456', 's', '123456 - expires in 10 min', true, 'spaced dash after'],
+  ['123456', 's', 'G-123456 is your Google verification code', true, 'prefix label'],
+  ['G-123456', 's', 'G-123456 is your Google verification code', true, 'code with its prefix'],
+]) {
+  test(`isPlausibleCode ${accepted ? 'accepts' : 'rejects'}: ${label}`, () => {
+    assert.strictEqual(pure.isPlausibleCode(code, subject, body), accepted);
+  });
 }
 
-test('hallucination filter rejects junk codes', async () => {
-  const answer = { value: '' };
-  const detect = nanoDetector(answer);
-  answer.value = 'Save 20% on your next order!';
-  assert.strictEqual(await detect('s', 'f', 'b'), null, 'long junk rejected');
-  answer.value = '123456';
-  assert.strictEqual(await detect('s', 'f', 'Your code is 123 456'), '123456', 'grounded, spacing ignored');
-  answer.value = '';
-  assert.strictEqual(await detect('s', 'f', 'b'), null);
+test('grounding stays linear-time on hostile input (no catastrophic backtracking)', () => {
+  const t = Date.now();
+  pure.isPlausibleCode('aaaaaaaaaaaaaaaaaaab', 's', ('a' + ' '.repeat(50)).repeat(20000));
+  assert.ok(Date.now() - t < 1000, `took ${Date.now() - t}ms`);
 });
 
-test('sanity filter rejects placeholder words and codes not present in the email', async () => {
-  const answer = { value: '' };
-  const detect = nanoDetector(answer);
-  const body = 'None of your orders shipped. null true ---- 2025 SAVE20';
-  for (const junk of ['None', 'null', 'true', '----']) {
-    answer.value = junk;
-    assert.strictEqual(await detect('s', 'f', body), null, `${junk} rejected`);
-  }
-  answer.value = '482913';
-  assert.strictEqual(await detect('Your code', 'f', 'Thanks for shopping!'), null, 'hallucinated code rejected');
-  assert.strictEqual(await detect('Your code is 482-913', 'f', 'x'), '482913', 'code found in subject');
+test('detectCode grounds the model answer on the live path (ungrounded -> null; spaced answer is stripped)', async () => {
+  const answer = { value: '482913' };
+  const env = makeEnv({}, { LanguageModel: mockLanguageModel({ respond: () => answer.value }) });
+  const detect = (subject, body) => env.sandbox.detectCode(subject, 'f', body);
+  assert.strictEqual(await detect('Your code', 'Thanks for shopping!'), null, 'hallucinated code rejected');
+  assert.strictEqual(await detect('Your code is 482-913', 'x'), '482913');
+  answer.value = 'abcd efgh ijkl mnop';
+  assert.strictEqual(await detect('s', 'Your app password: abcd efgh ijkl mnop'), 'abcdefghijklmnop');
 });
 
 test('duplicate messages are not reprocessed across pushes (persisted dedup)', async () => {
   const env = makeEnv({ lastHistoryId: '100', pushActive: true, processedMessageIds: ['dup1'] });
-  let fetched = 0;
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'dup1' } }] }] });
-    if (url.includes('/messages/dup1')) { fetched++; return jsonResponse(gmailMessage('dup1', 'code 909090')); }
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { messages: { dup1: 'code 909090' } });
   await firePush(env);
-  assert.strictEqual(fetched, 0, 'already-processed message not fetched again');
+  assert.ok(!env.fetchLog.some((u) => String(u).includes('/messages/dup1')), 'already-processed message not fetched again');
 });
 
-test('setupGmailWatch does NOT overwrite an existing cursor', async () => {
+test('setupGmailWatch does NOT overwrite an existing cursor; failures name the watch step', async () => {
   const env = makeEnv({ lastHistoryId: '123', pushActive: true });
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/watch')) return jsonResponse({ historyId: '99999', expiration: String(Date.now() + 7 * 86400000) });
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { routes: { '/watch': () => jsonResponse({ historyId: '99999', expiration: String(Date.now() + 7 * 86400000) }) } });
   await env.sandbox.restoreState();
   await env.sandbox.setupGmailWatch();
   assert.strictEqual(env.storage.lastHistoryId, '123', 'cursor preserved across watch renewal');
-  assert.ok(env.alarms['gmail-watch-renew'], 'renewal alarm scheduled');
-});
-
-test('watch renewal failure schedules a retry alarm', async () => {
-  const env = makeEnv({ pushActive: true });
-  env.setFetch(async (url) => {
-    if (String(url).includes('/watch')) return jsonResponse({ error: 'boom' }, 500);
-    throw new Error('unexpected fetch: ' + url);
-  });
-  await env.sandbox.restoreState();
-  await env.sandbox.renewWatchWithRetry();
-  assert.ok(env.alarms['gmail-watch-renew'], 'retry alarm exists after failure');
-  assert.strictEqual(env.alarms['gmail-watch-renew'].delayInMinutes, 15);
-});
-
-test('silent auth failure flags needsAuth and raises a notification', async () => {
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true });
-  env.sandbox.chrome.identity.getAuthToken = (opts, cb) => {
-    env.sandbox.chrome.runtime.lastError = { message: 'OAuth2 not granted' };
-    cb(undefined);
-    env.sandbox.chrome.runtime.lastError = null;
-  };
-  await firePush(env);
-  assert.strictEqual(env.storage.needsAuth, true);
-  assert.ok(env.notifications.some((n) => n.id === 'needs-auth'), 'needs-auth notification shown');
+  mailFetch(env, { routes: { '/watch': () => jsonResponse({ error: 'denied' }, 403) } });
+  await assert.rejects(env.sandbox.setupGmailWatch(), /^Error: Gmail watch failed: Gmail API 403/);
 });
 
 test('stale VAPID key triggers unsubscribe + resubscribe', async () => {
@@ -527,10 +529,7 @@ test('stale VAPID key triggers unsubscribe + resubscribe', async () => {
     toJSON: () => ({ endpoint: 'https://push.example/old' }),
     unsubscribe: async () => { unsubscribed = true; env.subscription = null; },
   };
-  env.setFetch(async (url) => {
-    if (String(url).startsWith('https://register.example/')) return jsonResponse({ success: true });
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { routes: monitoringRoutes });
   await env.sandbox.registerPushSubscription();
   assert.ok(unsubscribed, 'old subscription dropped');
   assert.ok(env.subscription, 'new subscription created');
@@ -556,7 +555,6 @@ test('concurrent pushes coalesce into a single drain (single-flight)', async () 
   assert.ok(historyCalls <= 2, `expected coalesced drains, got ${historyCalls}`);
   assert.strictEqual(p1, p2, 'second call returns the in-flight promise');
 });
-
 
 test('server staleEndpoint response mints a fresh subscription', async () => {
   const env = makeEnv({ subVersion: 2 });
@@ -603,9 +601,7 @@ test('restoreState recovers after a transient storage failure', async () => {
   // fix resets statePromise so the NEXT call re-reads storage successfully.
   // (let-bound module state isn't reachable on the vm global, so observe the
   // restored state through the getStatus handler.)
-  const status = await new Promise((resolve) => {
-    env.listeners.message[0]({ action: 'getStatus' }, null, resolve);
-  });
+  const status = await ask(env, { action: 'getStatus' });
   assert.strictEqual(status.pushActive, true, 'state restored after transient failure');
 });
 
@@ -615,18 +611,7 @@ test('processing stops at first retryable failure preserving order', async () =>
   // retryably before reaching the model.
   const lm = mockLanguageModel({ respond: () => { env.offscreenDown = true; return '111111'; } });
   env = makeEnv({ lastHistoryId: '10', pushActive: true }, { offscreenLanguageModel: lm });
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) {
-      return jsonResponse({ historyId: '20', history: [
-        { messagesAdded: [{ message: { id: 'a1' } }, { message: { id: 'a2' } }, { message: { id: 'a3' } }] },
-      ]});
-    }
-    if (url.includes('/messages/a1')) return jsonResponse(gmailMessage('a1', 'code 111111'));
-    if (url.includes('/messages/a2')) return jsonResponse(gmailMessage('a2', 'code 222222'));
-    if (url.includes('/messages/a3')) return jsonResponse(gmailMessage('a3', 'code 333333'));
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { messages: { a1: 'code 111111', a2: 'code 222222', a3: 'code 333333' }, historyId: '20' });
   await firePush(env);
   // a1 processed; a2 failed -> stop; a3 still queued BEHIND a2 (order preserved)
   assert.deepStrictEqual([...env.storage.pendingMessageIds], ['a2', 'a3'], 'order preserved on failure');
@@ -634,57 +619,36 @@ test('processing stops at first retryable failure preserving order', async () =>
   assert.strictEqual(lm.prompts.length, 1, 'only a1 reached the model');
 });
 
-test('16-char app password passes the sanity filter', async () => {
-  const detect = nanoDetector({ value: 'abcd efgh ijkl mnop' });
-  const code = await detect('s', 'f', 'Your app password: abcd efgh ijkl mnop');
-  assert.strictEqual(code, 'abcdefghijklmnop');
-});
-
 // --- Regression tests for the deep-review fixes ---
 
-test('no on-device model keeps messages queued and surfaces an error (not silently consumed)', async () => {
-  // Chrome without the Prompt API anywhere (offscreen reports 'unsupported').
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true });
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'k1' } }] }] });
-    if (url.includes('/messages/k1')) return jsonResponse(gmailMessage('k1', 'code 111111'));
-    throw new Error('unexpected fetch: ' + url);
+// No usable on-device model: mail stays queued (not consumed as "no code") and
+// the notification names what's missing.
+for (const [opts, nano, advice] of [
+  [{}, 'unsupported', /Chrome 138\+/], // no Prompt API anywhere (offscreen reports 'unsupported')
+  [{ LanguageModel: mockLanguageModel({ availability: 'unavailable', respond: () => '135790' }) }, 'unavailable', /isn't available on this device.*RAM/],
+]) {
+  test(`Nano ${nano}: mail stays queued and the error names the requirements`, async () => {
+    const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, opts);
+    mailFetch(env, { messages: { k1: 'Your code is 135790' } });
+    await firePush(env);
+    assert.strictEqual(env.clipboard, undefined);
+    assert.strictEqual(opts.LanguageModel?.prompts.length ?? 0, 0);
+    assert.strictEqual(cloudFetches(env), 0);
+    assert.deepStrictEqual(env.storage.pendingMessageIds, ['k1'], 'message stays queued');
+    assert.ok(!(env.storage.processedMessageIds || []).includes('k1'), 'not marked processed');
+    assert.strictEqual(env.storage.detectorError.nano, nano);
+    const note = env.notifications.find((n) => n.id === 'detector-error');
+    assert.ok(note, 'user is told');
+    assert.match(note.opts.message, advice, 'names the requirements');
+    assert.doesNotMatch(note.opts.message, /key/i, 'no API key advice');
   });
-  await firePush(env);
-  assert.deepStrictEqual(env.storage.pendingMessageIds, ['k1'], 'message stays queued');
-  assert.ok(!(env.storage.processedMessageIds || []).includes('k1'), 'not marked processed');
-  assert.strictEqual(env.storage.detectorError.nano, 'unsupported');
-  const note = env.notifications.find((n) => n.id === 'detector-error');
-  assert.ok(note, 'user is told');
-  assert.match(note.opts.message, /Chrome 138\+/, 'names the requirements');
-  assert.doesNotMatch(note.opts.message, /key/i, 'no API key advice');
-});
+}
 
-test('startMonitoring refuses when this Chrome has no on-device model', async () => {
-  const env = makeEnv({}); // offscreen reports 'unsupported'
-  await assert.rejects(env.sandbox.startMonitoring(), /on-device model.*Chrome 138\+/);
-  assert.ok(!env.storage.setupDone);
-});
-
-test('messages older than MAX_CODE_AGE_MS are skipped without calling the model', async () => {
-  const lm = mockLanguageModel({ respond: () => '999999' });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: lm });
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'old1' } }] }] });
-    if (url.includes('/messages/old1')) return jsonResponse({ ...gmailMessage('old1', 'code 999999'), internalDate: String(Date.now() - 3600000) });
-    throw new Error('unexpected fetch: ' + url);
-  });
-  await firePush(env);
-  assert.strictEqual(lm.prompts.length, 0);
-  assert.strictEqual(env.clipboard, undefined, 'stale code not copied');
-  assert.deepStrictEqual(env.storage.pendingMessageIds, [], 'consumed');
-});
-
-// Real-world case: an airline OTP sender's Date header was 12h in the past ("8:23:59 +0530"
-// for 20:23:59), Gmail copied it into internalDate, and the age gate dropped a
-// fresh code. Gmail's own Received stamp is the arrival time.
+// Login codes expire: anything older than MAX_CODE_AGE_MS is consumed without
+// a model call. Arrival is the later of internalDate and Gmail's own Received
+// stamp. Real-world case for the Received rows: an airline OTP sender's Date
+// header was 12h in the past ("8:23:59 +0530" for 20:23:59), Gmail copied it
+// into internalDate, and the age gate dropped a fresh code.
 function withReceived(msg, receivedMs, internalMs) {
   const stamp = new Date(receivedMs).toUTCString().replace('GMT', '-0000');
   msg.internalDate = String(internalMs);
@@ -695,24 +659,23 @@ function withReceived(msg, receivedMs, internalMs) {
   return msg;
 }
 
-for (const [label, receivedAgoMin, expectCopied] of [
-  ['fresh arrival with a 12h-stale internalDate is processed', 1, true],
-  ['old arrival is still skipped even with a Received header', 60, false],
+for (const [internalAgoMin, receivedAgoMin, copied] of [
+  [14, null, true], [16, null, false], [60, null, false],
+  [720, 1, true], [720, 60, false],
 ]) {
-  test(`age gate: ${label}`, async () => {
-    const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: mockLanguageModel({ respond: () => '246810' }) });
-    const body = '246810 is your One Time Password. Do not share this OTP with anyone.';
-    env.setFetch(async (url) => {
-      url = String(url);
-      if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'ind' } }] }] });
-      if (url.includes('/messages/ind')) {
-        return jsonResponse(withReceived(gmailMessage('ind', body, 'OTP for your airline account'),
-          Date.now() - receivedAgoMin * 60000, Date.now() - 12 * 3600000));
-      }
-      throw new Error('unexpected fetch: ' + url);
-    });
+  const received = receivedAgoMin === null ? '' : `, Received ${receivedAgoMin} min ago`;
+  test(`age gate: internalDate ${internalAgoMin} min ago${received} -> ${copied ? 'copied' : 'skipped'}`, async () => {
+    const lm = mockLanguageModel({ respond: () => '246810' });
+    const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: lm });
+    const msg = gmailMessage('m', '246810 is your One Time Password. Do not share this OTP with anyone.', 'OTP for your airline account');
+    const internalMs = Date.now() - internalAgoMin * 60000;
+    if (receivedAgoMin === null) msg.internalDate = String(internalMs);
+    else withReceived(msg, Date.now() - receivedAgoMin * 60000, internalMs);
+    mailFetch(env, { messages: { m: msg } });
     await firePush(env);
-    assert.strictEqual(env.clipboard, expectCopied ? '246810' : undefined);
+    assert.strictEqual(env.clipboard, copied ? '246810' : undefined);
+    assert.strictEqual(lm.prompts.length, copied ? 1 : 0, 'no model call for a stale code');
+    assert.deepStrictEqual(env.storage.pendingMessageIds, [], 'consumed');
   });
 }
 
@@ -773,74 +736,52 @@ test('labelAdded INBOX (e.g. "Not spam") is enqueued, and duplicate ids in one b
 });
 
 test('extractBody leaves "<" in plain text alone (no tag stripping on text/plain)', async () => {
-  const env = makeEnv();
-  const body = env.sandbox.extractBody(gmailMessage('p', 'Code expires in <10 minutes.\nYour code: 482913\nHelp: <https://help.x.com>'));
+  const body = extract(plain('Code expires in <10 minutes.\nYour code: 482913\nHelp: <https://help.x.com>'));
   assert.ok(body.includes('482913'), `got: ${body}`);
 });
 
 test('extractBody adds the HTML when the plain part is a stub without the code', async () => {
-  const env = makeEnv();
-  const msg = { payload: { mimeType: 'multipart/alternative', parts: [
-    { mimeType: 'text/plain', body: { data: b64url('View this email in your browser: https://x.com/v') } },
-    { mimeType: 'text/html', body: { data: b64url('<p>Your code is <b>482913</b></p>') } },
-  ] } };
-  assert.ok(env.sandbox.extractBody(msg).includes('482913'));
+  const msg = multi('multipart/alternative', plain('View this email in your browser: https://x.com/v'), html('<p>Your code is <b>482913</b></p>'));
+  assert.ok(extract(msg).includes('482913'));
 });
 
 test('extractBody decodes the declared charset and numeric entities', async () => {
-  const env = makeEnv();
-  const latin1 = Buffer.from('Votre code: 482913 — café', 'latin1');
-  const msg = { payload: { mimeType: 'text/plain', headers: [{ name: 'Content-Type', value: 'text/plain; charset="ISO-8859-1"' }],
-    body: { data: latin1.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') } } };
-  assert.ok(env.sandbox.extractBody(msg).includes('café'));
-  const html = { payload: { mimeType: 'text/html', body: { data: b64url('<p>Code: &#52;&#56;&#50;&#57;&#49;&#51;</p>') } } };
-  assert.ok(env.sandbox.extractBody(html).includes('482913'));
+  assert.ok(extract(plain(Buffer.from('Votre code: 482913 — café', 'latin1'), 'ISO-8859-1')).includes('café'));
+  assert.ok(extract(html('<p>Code: &#52;&#56;&#50;&#57;&#49;&#51;</p>')).includes('482913'));
 });
 
 test('extractBody stays fast on hostile input (no quadratic regex)', async () => {
-  const env = makeEnv();
   for (const evil of ['1 < 2 '.repeat(200000), '<!-- '.repeat(200000), '<style '.repeat(200000)]) {
-    const msg = { payload: { mimeType: 'text/html', body: { data: b64url('Your code 123456 ' + evil) } } };
     const t = Date.now();
-    env.sandbox.extractBody(msg);
+    extract(html('Your code 123456 ' + evil));
     assert.ok(Date.now() - t < 1000, `took ${Date.now() - t}ms`);
   }
 });
 
 test('offline token failure does not raise the sticky re-authorization alert', async () => {
   const env = makeEnv({ lastHistoryId: '100', pushActive: true });
-  env.sandbox.chrome.identity.getAuthToken = (opts, cb) => {
-    env.sandbox.chrome.runtime.lastError = { message: 'OAuth2 request failed: Connection failed (-106).' };
-    cb(undefined);
-    env.sandbox.chrome.runtime.lastError = null;
-  };
+  denyAuth(env, 'OAuth2 request failed: Connection failed (-106).');
   await firePush(env);
   assert.ok(!env.storage.needsAuth);
   assert.ok(!env.notifications.some((n) => n.id === 'needs-auth'));
 });
 
-test('needs-auth notification is raised once, not on every subsequent push', async () => {
+test('silent auth failure flags needsAuth and notifies once, not on every subsequent push', async () => {
   const env = makeEnv({ lastHistoryId: '100', pushActive: true });
-  env.sandbox.chrome.identity.getAuthToken = (opts, cb) => {
-    env.sandbox.chrome.runtime.lastError = { message: 'OAuth2 not granted or revoked.' };
-    cb(undefined);
-    env.sandbox.chrome.runtime.lastError = null;
-  };
+  denyAuth(env, 'OAuth2 not granted or revoked.');
   await firePush(env);
   await firePush(env);
   await firePush(env);
+  assert.strictEqual(env.storage.needsAuth, true);
   assert.strictEqual(env.notifications.filter((n) => n.id === 'needs-auth').length, 1);
 });
 
 test('health check updates pushActive in both directions', async () => {
   const env = makeEnv({ setupDone: true, pushActive: false, lastHistoryId: '100', subVersion: 2, watchExpiration: Date.now() + 5 * 86400000 });
   let registerOk = true;
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.startsWith('https://register.example/')) return registerOk ? jsonResponse({ success: true }) : jsonResponse({ error: 'x' }, 500);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '100', history: [] });
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { historyId: '100', routes: {
+    'https://register.example/': () => (registerOk ? jsonResponse({ success: true }) : jsonResponse({ error: 'x' }, 500)),
+  } });
   await env.sandbox.restoreState();
   await env.sandbox.healthCheck();
   assert.strictEqual(env.storage.pushActive, true, 'healed push is reported');
@@ -849,13 +790,134 @@ test('health check updates pushActive in both directions', async () => {
   assert.strictEqual(env.storage.pushActive, false, 'dead push is reported');
 });
 
+// Listeners that fire-and-forget a promise chain (alarms, startup, notification
+// clicks): let it run to completion. Mock timers fire synchronously, so a few
+// macrotask turns are enough.
+async function settle() {
+  for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+}
+
+const nearExpiry = () => Date.now() + 60000; // inside WATCH_RENEW_MARGIN_MS
+const farExpiry = () => Date.now() + 5 * 86400000;
+
+test('the health-check alarm renews a watch close to expiry; unknown and prototype-named alarms do nothing', async () => {
+  const env = makeEnv({ setupDone: true, pushActive: true, lastHistoryId: '100', subVersion: 2, watchExpiration: nearExpiry() });
+  const before = env.storage.watchExpiration;
+  mailFetch(env, { historyId: '100', routes: monitoringRoutes });
+  env.listeners.alarm[0]({ name: 'health-check' });
+  await settle();
+  assert.ok(env.fetchLog.some((u) => String(u).includes('/watch')), 'watch renewed');
+  assert.ok(env.storage.watchExpiration > before + 86400000, 'expiration moved forward');
+  assert.strictEqual(env.storage.pushActive, true);
+
+  for (const name of ['toString', 'constructor', 'gmail-watch-renew']) {
+    const quiet = makeEnv({ setupDone: true, lastHistoryId: '100', subVersion: 2, watchExpiration: nearExpiry() });
+    mailFetch(quiet, { routes: monitoringRoutes });
+    assert.doesNotThrow(() => quiet.listeners.alarm[0]({ name }), name);
+    await settle();
+    assert.deepStrictEqual(quiet.fetchLog, [], name);
+  }
+});
+
+test('the health check leaves a watch that is far from expiry alone', async () => {
+  const env = makeEnv({ setupDone: true, lastHistoryId: '100', subVersion: 2, watchExpiration: farExpiry() });
+  mailFetch(env, { historyId: '100', routes: monitoringRoutes });
+  await env.sandbox.restoreState();
+  await env.sandbox.healthCheck();
+  assert.ok(!env.fetchLog.some((u) => String(u).includes('/watch')));
+  assert.ok(env.fetchLog.some((u) => String(u).includes('https://register.example/')), 'push re-registered');
+});
+
+test('Start always re-creates the watch, even one far from expiry', async () => {
+  const env = makeEnv({ lastHistoryId: '100', subVersion: 2, watchExpiration: farExpiry() }, { LanguageModel: mockLanguageModel() });
+  mailFetch(env, { historyId: '100', routes: monitoringRoutes });
+  await env.sandbox.startMonitoring();
+  assert.ok(env.fetchLog.some((u) => String(u).includes('/watch')));
+});
+
+for (const event of ['installed', 'startup']) {
+  test(`on ${event}: health-check alarm exists, needs-auth alert re-raised, mail queued while Chrome was closed drains, push repaired`, async () => {
+    const lm = mockLanguageModel({ respond: () => '135790' });
+    const env = makeEnv({
+      setupDone: true, needsAuth: true, pushActive: true, lastHistoryId: '100', subVersion: 2,
+      watchExpiration: farExpiry(), pendingMessageIds: ['s1'],
+    }, { LanguageModel: lm });
+    mailFetch(env, { messages: { s1: 'Your code is 135790' }, history: [], historyId: '100', routes: monitoringRoutes });
+    assert.strictEqual(env.listeners[event].length, 1);
+    env.listeners[event][0]();
+    await settle();
+    assert.ok(env.alarms['health-check'], 'alarm scheduled');
+    assert.ok(env.notifications.some((n) => n.id === 'needs-auth'), 'alert re-raised after restart');
+    assert.deepStrictEqual(env.storage.pendingMessageIds, [], 'queue drained');
+    assert.strictEqual(env.clipboard, '135790');
+    assert.ok(env.fetchLog.some((u) => String(u).includes('https://register.example/')), 'push re-registered');
+  });
+}
+
+test('on startup before setup: nothing is scheduled, raised or fetched', async () => {
+  const env = makeEnv({ needsAuth: true });
+  mailFetch(env, { routes: monitoringRoutes });
+  env.listeners.startup[0]();
+  await settle();
+  assert.deepStrictEqual(env.alarms, {});
+  assert.deepStrictEqual(env.notifications, []);
+  assert.deepStrictEqual(env.fetchLog, []);
+});
+
+// Clicking the needs-auth notification re-authorizes. After setup it also
+// drains and repairs push; before setup it re-authorizes only (draining would
+// raise a bogus alert for a brand-new user).
+for (const { setupDone, drains } of [{ setupDone: true, drains: true }, { setupDone: false, drains: false }]) {
+  test(`needs-auth click with setupDone=${setupDone}: re-authorizes${drains ? ', drains and repairs push' : ' only, fetches nothing'}`, async () => {
+    const lm = mockLanguageModel({ respond: () => '246813' });
+    // No pushActive: restoreState would migrate it to setupDone=true.
+    const env = makeEnv({
+      setupDone, needsAuth: true, lastHistoryId: '100', subVersion: 2,
+      watchExpiration: farExpiry(), pendingMessageIds: ['c1'],
+    }, { LanguageModel: lm });
+    mailFetch(env, { messages: { c1: 'Your code is 246813' }, history: [], historyId: '100', routes: monitoringRoutes });
+    let interactive;
+    const realGet = env.sandbox.chrome.identity.getAuthToken;
+    env.sandbox.chrome.identity.getAuthToken = (opts, cb) => { interactive ??= opts.interactive; realGet(opts, cb); };
+    env.listeners.notificationClicked[0]('needs-auth');
+    await settle();
+    assert.strictEqual(interactive, true, 'interactive prompt allowed on click');
+    assert.strictEqual(env.storage.needsAuth, false);
+    if (drains) {
+      assert.deepStrictEqual(env.storage.pendingMessageIds, [], 'queue drained');
+      assert.strictEqual(env.clipboard, '246813');
+      assert.ok(env.fetchLog.some((u) => String(u).includes('https://register.example/')), 'push re-registered');
+    } else {
+      assert.deepStrictEqual(env.fetchLog, []);
+      assert.deepStrictEqual(env.storage.pendingMessageIds, ['c1']);
+    }
+  });
+}
+
+test('needs-auth click whose consent fails re-raises the alert; other notification clicks are ignored', async () => {
+  const env = makeEnv({ setupDone: true, needsAuth: true, lastHistoryId: '100' });
+  mailFetch(env, { routes: monitoringRoutes });
+  denyAuth(env, 'The user did not approve access.');
+  env.listeners.notificationClicked[0]('needs-auth');
+  await settle();
+  assert.strictEqual(env.notifications.filter((n) => n.id === 'needs-auth').length, 1, 're-raised');
+  assert.strictEqual(env.storage.needsAuth, true);
+  assert.deepStrictEqual(env.fetchLog, []);
+
+  const other = makeEnv({ setupDone: true, needsAuth: true, lastHistoryId: '100' });
+  mailFetch(other, { routes: monitoringRoutes });
+  other.listeners.notificationClicked[0]('code-copied');
+  await settle();
+  assert.deepStrictEqual(other.fetchLog, []);
+  assert.strictEqual(other.storage.needsAuth, true);
+});
+
 test('register-push sends the OAuth token for server-side authentication', async () => {
   const env = makeEnv({ subVersion: 2 });
   let auth;
-  env.setFetch(async (url, opts) => {
-    if (String(url).startsWith('https://register.example/')) { auth = opts.headers.Authorization; return jsonResponse({ success: true }); }
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { routes: {
+    'https://register.example/': (url, opts) => { auth = opts.headers.Authorization; return jsonResponse({ success: true }); },
+  } });
   await env.sandbox.registerPushSubscription();
   assert.strictEqual(auth, 'Bearer tok');
 });
@@ -863,17 +925,14 @@ test('register-push sends the OAuth token for server-side authentication', async
 // --- Regression tests for the second (fix-diff) review ---
 
 test('stripHiddenBlocks keeps indices aligned when text contains İ (Turkish dotted capital I)', async () => {
-  const env = makeEnv();
-  const html = '<p>Merhaba, İŞ BANKASI İNTERNET ŞUBESİ giriş kodunuz: <b>482913</b></p><!-- c --><p>İyi günler</p>';
-  const body = env.sandbox.extractBody({ payload: { mimeType: 'text/html', body: { data: b64url(html) } } });
+  const body = extract(html('<p>Merhaba, İŞ BANKASI İNTERNET ŞUBESİ giriş kodunuz: <b>482913</b></p><!-- c --><p>İyi günler</p>'));
   assert.ok(body.includes('kodunuz: 482913'), `got: ${body}`);
   assert.ok(!body.includes('<'), `markup leaked: ${body}`);
   assert.ok(body.endsWith('İyi günler'), `got: ${body}`);
 });
 
 test('an unclosed <head>/<style> no longer deletes the rest of the document; </header> does not close <head>', async () => {
-  const env = makeEnv();
-  const x = (html) => env.sandbox.extractBody({ payload: { mimeType: 'text/html', body: { data: b64url(html) } } });
+  const x = (page) => extract(html(page));
   assert.ok(x('<html><head><meta charset=utf-8><body><p>Your code is 482913</p>').includes('482913'));
   assert.ok(x('<style>.a{}<p>Your code is 482913</p>').includes('482913'));
   const b = x('<head><title>t</title></header>hidden</head><p>Your code is 482913</p>');
@@ -881,33 +940,10 @@ test('an unclosed <head>/<style> no longer deletes the rest of the document; </h
 });
 
 test('HTML is included even when a stub plain part contains a year/ZIP', async () => {
-  const env = makeEnv();
-  const msg = { payload: { mimeType: 'multipart/alternative', parts: [
-    { mimeType: 'text/plain', body: { data: b64url('View this email in your browser. © 2026 Acme Inc, 548 Market St, San Francisco CA 94104') } },
-    { mimeType: 'text/html', body: { data: b64url('<p>Your code is <b>482913</b></p>') } },
-  ] } };
-  assert.ok(env.sandbox.extractBody(msg).includes('482913'));
-});
-
-test('grounding accepts codes separated by non-breaking hyphen, en dash, middot or dot', async () => {
-  const detect = nanoDetector({ value: '123456' });
-  for (const shown of ['123‑456', '123–456', '123·456', '123.456', '123 456']) {
-    assert.strictEqual(await detect('s', 'f', `Your code: ${shown}`), '123456', shown);
-  }
-});
-
-test('age gate: 14-minute-old message is processed, 16-minute-old is skipped', async () => {
-  for (const [mins, expectCopied] of [[14, true], [16, false]]) {
-    const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: mockLanguageModel({ respond: () => '135790' }) });
-    env.setFetch(async (url) => {
-      url = String(url);
-      if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'm' } }] }] });
-      if (url.includes('/messages/m')) return jsonResponse({ ...gmailMessage('m', 'code 135790'), internalDate: String(Date.now() - mins * 60000) });
-      throw new Error('unexpected fetch: ' + url);
-    });
-    await firePush(env);
-    assert.strictEqual(env.clipboard === '135790', expectCopied, `${mins} min`);
-  }
+  const msg = multi('multipart/alternative',
+    plain('View this email in your browser. © 2026 Acme Inc, 548 Market St, San Francisco CA 94104'),
+    html('<p>Your code is <b>482913</b></p>'));
+  assert.ok(extract(msg).includes('482913'));
 });
 
 test('age gate uses Google\'s clock (Date header), so a fast local clock does not drop fresh codes', async () => {
@@ -915,12 +951,9 @@ test('age gate uses Google\'s clock (Date header), so a fast local clock does no
   const realNow = Date.now();
   const fastBy = 60 * 60000; // local clock 1h fast
   env.sandbox.Date = class extends Date { static now() { return realNow + fastBy; } };
-  const serverDate = { date: new Date(realNow).toUTCString() };
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'm' } }] }] }, 200, serverDate);
-    if (url.includes('/messages/m')) return jsonResponse({ ...gmailMessage('m', 'code 246802'), internalDate: String(realNow - 60000) }, 200, serverDate);
-    throw new Error('unexpected fetch: ' + url);
+  mailFetch(env, {
+    messages: { m: { ...gmailMessage('m', 'code 246802'), internalDate: String(realNow - 60000) } },
+    headers: { date: new Date(realNow).toUTCString() },
   });
   await firePush(env);
   assert.strictEqual(env.clipboard, '246802');
@@ -928,34 +961,33 @@ test('age gate uses Google\'s clock (Date header), so a fast local clock does no
 
 test('checkNow before setup does nothing (no bogus needs-auth alert for new users)', async () => {
   const env = makeEnv({});
-  env.sandbox.chrome.identity.getAuthToken = (opts, cb) => {
-    env.sandbox.chrome.runtime.lastError = { message: 'OAuth2 not granted or revoked.' };
-    cb(undefined);
-    env.sandbox.chrome.runtime.lastError = null;
-  };
-  const resp = await new Promise((resolve) => {
-    for (const fn of env.listeners.message) fn({ action: 'checkNow' }, {}, resolve);
-  });
+  denyAuth(env, 'OAuth2 not granted or revoked.');
+  const resp = await ask(env, { action: 'checkNow' });
   assert.strictEqual(resp.success, true);
   assert.ok(!env.storage.needsAuth);
   assert.ok(!env.notifications.some((n) => n.id === 'needs-auth'));
 });
 
+test('popup commands answer through one table; unknown and prototype-named actions are left for other listeners', async () => {
+  const env = makeEnv({});
+  for (const action of ['toString', 'constructor', 'clipboard-write', 'codeDetected']) {
+    let answered = false;
+    const ret = env.listeners.message[0]({ action }, {}, () => { answered = true; });
+    assert.strictEqual(ret, false, action);
+    assert.strictEqual(answered, false, action);
+  }
+});
+
 test('installs upgraded without setupDone persist it, so a failed repair keeps monitoring on', async () => {
   const env = makeEnv({ pushActive: true, lastHistoryId: '100', subVersion: 2, watchExpiration: Date.now() + 5 * 86400000 });
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.startsWith('https://register.example/')) return jsonResponse({ error: 'x' }, 500);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '100', history: [] });
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { historyId: '100', routes: { 'https://register.example/': () => jsonResponse({ error: 'x' }, 500) } });
   await env.sandbox.restoreState();
   assert.strictEqual(env.storage.setupDone, true, 'migrated');
   await env.sandbox.healthCheck();
   assert.strictEqual(env.storage.pushActive, false);
   const fresh = makeEnv({ ...env.storage });
   await fresh.sandbox.restoreState();
-  const status = await new Promise((resolve) => { for (const fn of fresh.listeners.message) fn({ action: 'getStatus' }, {}, resolve); });
+  const status = await ask(fresh, { action: 'getStatus' });
   assert.strictEqual(status.setupDone, true, 'still set up after restart');
   assert.match(status.pushError, /500/);
 });
@@ -978,22 +1010,10 @@ test('register-push: 401 evicts the cached token and retries; 403 surfaces an al
 
 // --- Gemini Nano (on-device) ---
 
-// One message `id` through a push. Any other fetch (e.g. a cloud model) throws.
-function singleMessageFetch(env, id, body, subject) {
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id } }] }] });
-    if (url.includes(`/messages/${id}`)) return jsonResponse(gmailMessage(id, body, subject));
-    throw new Error('unexpected fetch: ' + url);
-  });
-}
-const isCloudModelUrl = (u) => /generativelanguage\.googleapis\.com/.test(String(u));
-const cloudFetches = (env) => env.fetchLog.filter(isCloudModelUrl).length;
-
 test('pre-filter skips a marketing email without calling any model', async () => {
   const lm = mockLanguageModel({ respond: () => '123456' });
   const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: lm });
-  singleMessageFetch(env, 'mk', 'Save 20% on order 123456 with SAVE20. Shop now!', 'Black Friday starts now');
+  mailFetch(env, { messages: { mk: 'Save 20% on order 123456 with SAVE20. Shop now!' }, subject: 'Black Friday starts now' });
   await firePush(env);
   assert.strictEqual(lm.prompts.length, 0, 'Nano not called');
   assert.strictEqual(env.clipboard, undefined);
@@ -1002,20 +1022,18 @@ test('pre-filter skips a marketing email without calling any model', async () =>
 });
 
 test('pre-filter passes a blank-subject "Code is 9999" email (body-start rule)', async () => {
-  const env = makeEnv();
-  assert.strictEqual(env.sandbox.looksLikeCodeEmail('', 'Code is 9999'), true);
-  assert.strictEqual(env.sandbox.looksLikeCodeEmail('', 'Hi! Here is the agenda for 9999 Main St.'), false);
-  assert.strictEqual(env.sandbox.looksLikeCodeEmail('Hello', 'Your one-time password: 482913'), true);
+  assert.strictEqual(pure.looksLikeCodeEmail('', 'Code is 9999'), true);
+  assert.strictEqual(pure.looksLikeCodeEmail('', 'Hi! Here is the agenda for 9999 Main St.'), false);
+  assert.strictEqual(pure.looksLikeCodeEmail('Hello', 'Your one-time password: 482913'), true);
   const lm = mockLanguageModel({ respond: () => '9999' });
-  const env2 = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: lm });
-  singleMessageFetch(env2, 'b', 'Code is 9999', '');
-  await firePush(env2);
-  assert.strictEqual(env2.clipboard, '9999');
+  const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: lm });
+  mailFetch(env, { messages: { b: 'Code is 9999' }, subject: '' });
+  await firePush(env);
+  assert.strictEqual(env.clipboard, '9999');
 });
 
 test('pre-filter DONE rule skips "Your email address was verified..." unless the body leads with a code', async () => {
-  const env = makeEnv();
-  const gate = env.sandbox.looksLikeCodeEmail;
+  const gate = pure.looksLikeCodeEmail;
   assert.strictEqual(gate('Your email address was verified for Example DNS', 'Hello, you have successfully verified an email address. You can now start sending email.'), false);
   assert.strictEqual(gate('Your account has been verified', 'Welcome aboard!'), false);
   assert.strictEqual(gate('Your email was verified', 'Your verification code is 123456'), true, 'body-start wins');
@@ -1023,62 +1041,43 @@ test('pre-filter DONE rule skips "Your email address was verified..." unless the
   assert.strictEqual(gate('Your sign-in code', 'Enter 123456'), true);
 });
 
-test('Nano path copies a code with no cloud fetch, even with a legacy key still in storage', async () => {
+test('Nano path copies a code in the worker with no cloud fetch, one session per email', async () => {
   const lm = mockLanguageModel({ respond: () => '482913' });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true, geminiApiKey: 'old', setupDone: true }, { LanguageModel: lm });
-  singleMessageFetch(env, 'n1', 'Your verification code is 482913. It expires in 10 minutes.', 'Your code');
+  const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm });
+  mailFetch(env, { messages: { n1: 'Your verification code is 482913. It expires in 10 minutes.' } });
   await firePush(env);
   assert.strictEqual(env.clipboard, '482913');
   assert.strictEqual(cloudFetches(env), 0, 'email text never left the machine');
   assert.strictEqual(lm.prompts.length, 1);
-  assert.strictEqual(lm.clones, 1, 'one clone per email');
-  assert.ok(lm.destroyed >= 1, 'clone destroyed');
+  assert.strictEqual(lm.created, 1, 'one session per email');
+  assert.strictEqual(lm.destroyed, 1, 'session destroyed');
   assert.ok(!env.sentMessages.includes('nano-detect'), 'ran in the worker, not offscreen');
 });
 
 test('Nano gets the shared prompt builder\'s text, the maxLength schema and English session options', async () => {
   const lm = mockLanguageModel({ respond: () => '' });
   const env = makeEnv({}, { LanguageModel: lm });
-  await env.sandbox.detectCodeWithNano('Subj', 'a@b.c', 'Body 1');
+  await env.sandbox.detectCode('Subj', 'a@b.c', 'Body 1');
   assert.strictEqual(lm.prompts[0], env.sandbox.buildCodePrompt('a@b.c', 'Subj', 'Body 1'));
   assert.ok(lm.prompts[0].includes('From: a@b.c\nSubject: Subj\nBody:\nBody 1'));
   assert.strictEqual(lm.promptOpts[0].responseConstraint.properties.login_code.maxLength, 21);
   assert.ok(lm.promptOpts[0].signal, 'abortable');
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(lm.createOpts[0])), {
+  const { signal, ...sessionOpts } = lm.createOpts[0];
+  assert.ok(signal, 'create() is abortable');
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(sessionOpts)), {
     expectedInputs: [{ type: 'text', languages: ['en'] }], expectedOutputs: [{ type: 'text', languages: ['en'] }],
   });
-});
-
-test('Nano unavailable: mail stays queued and the error names the hardware requirements (a legacy key is ignored)', async () => {
-  const lm = mockLanguageModel({ availability: 'unavailable', respond: () => '135790' });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true, geminiApiKey: 'old' }, { LanguageModel: lm });
-  singleMessageFetch(env, 'g1', 'Your code is 135790', 'Your code');
-  await firePush(env);
-  assert.strictEqual(env.clipboard, undefined);
-  assert.strictEqual(lm.prompts.length, 0);
-  assert.strictEqual(cloudFetches(env), 0);
-  assert.deepStrictEqual(env.storage.pendingMessageIds, ['g1'], 'stays queued');
-  assert.strictEqual(env.storage.detectorError.nano, 'unavailable');
-  const note = env.notifications.find((n) => n.id === 'detector-error');
-  assert.match(note.opts.message, /isn't available on this device.*RAM/);
-  assert.doesNotMatch(note.opts.message, /key/i);
 });
 
 test('worker Prompt API says unavailable but the offscreen document has the model: monitoring starts and codes still copy there', async () => {
   const workerLM = mockLanguageModel({ availability: 'unavailable', respond: () => '000000' });
   const offscreenLM = mockLanguageModel({ respond: () => '864209' });
   const env = makeEnv({ subVersion: 2 }, { LanguageModel: workerLM, offscreenLanguageModel: offscreenLM });
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/profile')) return jsonResponse({ historyId: '77' });
-    if (url.startsWith('https://register.example/')) return jsonResponse({ success: true });
-    if (url.includes('/watch')) return jsonResponse({ historyId: '77', expiration: String(Date.now() + 7 * 86400000) });
-    throw new Error('unexpected fetch: ' + url);
-  });
+  mailFetch(env, { routes: monitoringRoutes });
   await env.sandbox.startMonitoring();
   assert.strictEqual(env.storage.setupDone, true);
   env.storage.pushActive = true;
-  singleMessageFetch(env, 'w1', 'Your verification code is 864209', 'Your code');
+  mailFetch(env, { messages: { w1: 'Your verification code is 864209' } });
   await firePush(env);
   assert.strictEqual(env.clipboard, '864209');
   assert.strictEqual(workerLM.prompts.length, 0, 'worker model never prompted');
@@ -1091,7 +1090,7 @@ test('worker Prompt API says unavailable but the offscreen document has the mode
 test('Nano downloadable: mail stays queued, detectorError set, a single notification; cleared once the model is ready', async () => {
   const lm = mockLanguageModel({ availability: 'downloadable', respond: () => '111111' });
   const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm });
-  singleMessageFetch(env, 'q1', 'Your login code is 111111', 'Sign in to Acme');
+  mailFetch(env, { messages: { q1: 'Your login code is 111111' }, subject: 'Sign in to Acme' });
   await firePush(env);
   await firePush(env);
   assert.deepStrictEqual(env.storage.pendingMessageIds, ['q1'], 'stays queued');
@@ -1102,8 +1101,7 @@ test('Nano downloadable: mail stays queued, detectorError set, a single notifica
   assert.match(notes[0].opts.message, /download/i);
   assert.doesNotMatch(notes[0].opts.message, /key/i, 'download is the only advice');
   assert.strictEqual(lm.prompts.length, 0);
-  const status = await new Promise((resolve) => { for (const fn of env.listeners.message) fn({ action: 'getStatus' }, {}, resolve); });
-  assert.strictEqual(status.engine, 'none');
+  const status = await ask(env, { action: 'getStatus' });
   assert.strictEqual(status.nanoAvailability, 'downloadable');
   assert.ok(status.detectorError);
 
@@ -1114,21 +1112,37 @@ test('Nano downloadable: mail stays queued, detectorError set, a single notifica
   assert.strictEqual(env.storage.detectorError, null, 'cleared on the next successful detection');
 });
 
-test('Nano throws once: retried on a fresh session and the code is copied', async () => {
-  const lm = mockLanguageModel({ failPrompts: 1, respond: () => '246810' });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm });
-  singleMessageFetch(env, 'f1', 'Your code is 246810', 'Your code');
-  await firePush(env);
-  assert.strictEqual(env.clipboard, '246810');
-  assert.strictEqual(lm.prompts.length, 2, 'one retry');
-  assert.ok(lm.created >= 2, 'retry used a fresh base session');
-  assert.ok(!env.storage.nanoFailStreak, 'a recovered email is not a failure');
-});
+// Both hosts: the Prompt API in the worker itself, or only in the offscreen
+// document. lm.prompts counts prove the worker retries once, not both layers.
+for (const host of ['LanguageModel', 'offscreenLanguageModel']) {
+  test(`Nano throws once (${host}): retried on a fresh session and the code is copied`, async () => {
+    const lm = mockLanguageModel({ failPrompts: 1, respond: () => '246810' });
+    const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { [host]: lm });
+    mailFetch(env, { messages: { f1: 'Your code is 246810' } });
+    await firePush(env);
+    assert.strictEqual(env.clipboard, '246810');
+    assert.strictEqual(lm.prompts.length, 2, 'one retry');
+    assert.ok(lm.created >= 2, 'retry used a fresh session');
+    assert.ok(!env.storage.nanoFailStreak, 'a recovered email is not a failure');
+  });
+
+  test(`Nano throws twice (${host}): that message is consumed without a copy and the queue continues`, async () => {
+    const lm = mockLanguageModel({ failPrompts: 2, respond: (t) => (t.includes('222222') ? '222222' : '111111') });
+    const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { [host]: lm });
+    mailFetch(env, { messages: { x1: 'Your code is 111111', x2: 'Your code is 222222' } });
+    await firePush(env);
+    assert.strictEqual(lm.prompts.length, 3, 'x1 tried twice, x2 once');
+    assert.ok(lm.created >= 2, 'retry used a fresh session');
+    assert.strictEqual(env.clipboard, '222222', 'x1 skipped, x2 copied');
+    assert.deepStrictEqual(env.storage.pendingMessageIds, []);
+    assert.ok(!env.storage.detectorError);
+  });
+}
 
 test('Nano hangs: each try times out, the email is consumed and the queue continues', async () => {
   const lm = mockLanguageModel({ hang: true });
   const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm, fireLongTimers: true });
-  singleMessageFetch(env, 't1', 'Your code is 864200', 'Your code');
+  mailFetch(env, { messages: { t1: 'Your code is 864200' } });
   await firePush(env);
   assert.strictEqual(env.clipboard, undefined);
   assert.strictEqual(lm.prompts.length, 2, 'tried twice');
@@ -1136,57 +1150,20 @@ test('Nano hangs: each try times out, the email is consumed and the queue contin
   assert.strictEqual(env.storage.nanoFailStreak, 1);
 });
 
-test('Nano throws twice: that message is consumed without a copy and the queue continues', async () => {
-  const lm = mockLanguageModel({ failPrompts: 2, respond: (t) => (t.includes('222222') ? '222222' : '111111') });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: lm });
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'x1' } }, { message: { id: 'x2' } }] }] });
-    if (url.includes('/messages/x1')) return jsonResponse(gmailMessage('x1', 'Your code is 111111'));
-    if (url.includes('/messages/x2')) return jsonResponse(gmailMessage('x2', 'Your code is 222222'));
-    throw new Error('unexpected fetch: ' + url);
-  });
-  await firePush(env);
-  assert.strictEqual(lm.prompts.length, 3, 'x1 tried twice, x2 once');
-  assert.ok(lm.created >= 2, 'retry used a fresh base session');
-  assert.strictEqual(env.clipboard, '222222', 'x1 skipped, x2 copied');
-  assert.deepStrictEqual(env.storage.pendingMessageIds, []);
-  assert.ok(!env.storage.detectorError);
-});
-
 test('service worker without LanguageModel runs Nano in the offscreen document (nano-detect message)', async () => {
   const lm = mockLanguageModel({ respond: () => '192837' });
   const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { offscreenLanguageModel: lm });
   assert.strictEqual(typeof env.sandbox.LanguageModel, 'undefined');
-  singleMessageFetch(env, 'o1', 'Your security code is 192837', 'Security code');
+  mailFetch(env, { messages: { o1: 'Your security code is 192837' }, subject: 'Security code' });
   await firePush(env);
   assert.strictEqual(env.clipboard, '192837');
   assert.ok(env.offscreen.received.includes('nano-availability'));
   assert.ok(env.offscreen.received.includes('nano-detect'));
   assert.strictEqual(lm.prompts.length, 1);
-  // Errors cross the boundary as { error: 'Name: message' } and are retried once.
-  lm.failPrompts = 2;
-  const errResp = await env.offscreen.send({ action: 'nano-detect', from: 'f', subject: 's', body: 'b' });
-  assert.match(errResp.error, /^UnknownError: /);
   // Other actions are left for the worker / popup listeners.
   assert.strictEqual(await env.offscreen.send({ action: 'getStatus' }), undefined);
-  const status = await new Promise((resolve) => { for (const fn of env.listeners.message) fn({ action: 'getStatus' }, {}, resolve); });
-  assert.strictEqual(status.engine, 'nano');
-});
-
-test('whole-token grounding rejects a 20-char prefix of a longer token', async () => {
-  const env = makeEnv();
-  const ok = env.sandbox.isPlausibleCode;
-  const jwt = 'eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.sig';
-  assert.strictEqual(ok('eyJhbGciOiJIUzUxMiIs', 'Sign in to Acme', `Click https://acme.com/magic?t=${jwt} to sign in`), false);
-  assert.strictEqual(ok('123456', 's', 'Order 91234567 shipped'), false, 'digits inside a longer number');
-  assert.strictEqual(ok('ABC123', 's', 'ref XABC123'), false, 'glued to a preceding letter');
-  assert.strictEqual(ok('abc123', 's', 'Your code: ABC123.'), true, 'case-insensitive, trailing dot ok');
-  assert.strictEqual(ok('123456', 's', 'code (123-456)'), true);
-  assert.strictEqual(ok('123456', 's', 'code 12_3456'), false, 'underscore is not a grouping separator');
-  const t = Date.now();
-  ok('aaaaaaaaaaaaaaaaaaab', 's', ('a' + ' '.repeat(50)).repeat(20000));
-  assert.ok(Date.now() - t < 1000, 'no catastrophic backtracking');
+  const status = await ask(env, { action: 'getStatus' });
+  assert.strictEqual(status.nanoAvailability, 'available');
 });
 
 test('a body longer than the context window is truncated by fitBody to fit', async () => {
@@ -1209,99 +1186,85 @@ test('nanoExtract parses login_code, strips whitespace, and returns "" on non-JS
   const r = await env.sandbox.nanoExtract({ from: 'f', subject: 's', body: 'b' });
   assert.strictEqual(r.code, '123456');
   assert.strictEqual(r.raw, JSON.stringify({ login_code: ' 123 456 ' }));
-  lm.create = async () => ({ clone: async () => ({ contextWindow: 9216, measureContextUsage: async () => 1, prompt: async () => 'not json', destroy() {} }) });
-  // Base is cached: force a fresh one through the failure path first.
-  lm.failPrompts = 1;
-  await assert.rejects(env.sandbox.nanoExtract({ body: 'b' }), /generic/);
+  lm.create = async () => ({ contextWindow: 9216, measureContextUsage: async () => 1, prompt: async () => 'not json', destroy() {} });
   const r2 = await env.sandbox.nanoExtract({ body: 'b' });
   assert.strictEqual(r2.code, '');
 });
 
 test('nanoAvailability reports unsupported without the Prompt API', async () => {
-  const env = makeEnv();
-  assert.strictEqual(await env.sandbox.nanoAvailability(), 'unsupported');
+  assert.strictEqual(await pure.nanoAvailability(), 'unsupported');
   const env2 = makeEnv({}, { LanguageModel: mockLanguageModel({ availability: 'downloading' }) });
   assert.strictEqual(await env2.sandbox.nanoAvailability(), 'downloading');
 });
 
-test('getStatus reports the active engine', async () => {
+test('getStatus reports the model availability and no cloud fields', async () => {
   let st = await ask(makeEnv({}, { LanguageModel: mockLanguageModel() }), { action: 'getStatus' });
-  assert.deepStrictEqual([st.engine, st.nanoAvailability], ['nano', 'available']);
-  st = await ask(makeEnv({ geminiApiKey: 'old' }), { action: 'getStatus' });
-  assert.deepStrictEqual([st.engine, st.nanoAvailability], ['none', 'unsupported'], 'a legacy key is not an engine');
-  assert.ok(!('hasApiKey' in st) && !('geminiError' in st), 'no cloud fields');
+  assert.strictEqual(st.nanoAvailability, 'available');
+  st = await ask(makeEnv(), { action: 'getStatus' });
+  assert.strictEqual(st.nanoAvailability, 'unsupported');
+  assert.ok(!('hasApiKey' in st) && !('geminiError' in st) && !('engine' in st), 'no cloud or engine fields');
   st = await ask(makeEnv({}, { LanguageModel: mockLanguageModel({ availability: 'downloading' }) }), { action: 'getStatus' });
-  assert.deepStrictEqual([st.engine, st.nanoAvailability], ['none', 'downloading']);
+  assert.strictEqual(st.nanoAvailability, 'downloading');
+  // A failed status read is an error, not a "Not set up" install.
+  st = await ask(makeEnv({}, { failGets: 2 }), { action: 'getStatus' });
+  assert.deepStrictEqual(Object.keys(st), ['error']);
 });
 
-test('startMonitoring is allowed while the model is downloadable or its host is unreachable; refused when unavailable', async () => {
-  const okFetch = async (url) => {
-    url = String(url);
-    if (url.includes('/profile')) return jsonResponse({ historyId: '77' });
-    if (url.startsWith('https://register.example/')) return jsonResponse({ success: true });
-    if (url.includes('/watch')) return jsonResponse({ historyId: '77', expiration: String(Date.now() + 7 * 86400000) });
-    throw new Error('unexpected fetch: ' + url);
-  };
+test('startMonitoring is allowed while the model is downloadable or its host is unreachable; refused when unavailable or unsupported', async () => {
   const env = makeEnv({ subVersion: 2 }, { LanguageModel: mockLanguageModel({ availability: 'downloadable' }) });
-  env.setFetch(okFetch);
+  mailFetch(env, { routes: monitoringRoutes });
   await env.sandbox.startMonitoring();
   assert.strictEqual(env.storage.setupDone, true);
+  assert.strictEqual(env.storage.pushActive, true);
   // Unreachable host: unknown, not "no model".
   const envU = makeEnv({ subVersion: 2 }, { offscreenLanguageModel: mockLanguageModel() });
   envU.offscreenDown = true;
-  envU.setFetch(okFetch);
+  mailFetch(envU, { routes: monitoringRoutes });
   await envU.sandbox.startMonitoring();
   assert.strictEqual(envU.storage.setupDone, true);
   const env2 = makeEnv({}, { LanguageModel: mockLanguageModel({ availability: 'unavailable' }) });
   await assert.rejects(env2.sandbox.startMonitoring(), /on-device model/);
   assert.ok(!env2.storage.setupDone);
+  const env3 = makeEnv({}); // offscreen reports 'unsupported'
+  await assert.rejects(env3.sandbox.startMonitoring(), /on-device model.*Chrome 138\+/);
+  assert.ok(!env3.storage.setupDone);
 });
 
-test('grounding refuses a capped prefix that continues with "_", "-" or "." + alphanumerics (incl. a 20-char JWT header)', async () => {
-  const env = makeEnv();
-  const ok = env.sandbox.isPlausibleCode;
-  const p = 'abcdefghijklmnopqrst';
-  assert.strictEqual(ok(p, '', `token=${p}_uvwxyz123`), false, 'underscore continuation');
-  assert.strictEqual(ok(p, '', `token=${p}-uvwxyz123`), false, 'dash continuation');
-  // {"alg":"HS256"} encodes to exactly 20 chars, so the cap lands on the '.'.
-  const hs = 'eyJhbGciOiJIUzI1NiJ9';
-  assert.strictEqual(ok(hs, 'Sign in to Acme', `https://acme.com/magic?token=${hs}.eyJzdWIiOiIxIn0.c2ln`), false, 'JWT segment');
-  assert.strictEqual(ok('123456', 's', 'x_123456'), false, 'underscore before');
-  // Ordinary punctuation around a real code still grounds.
-  assert.strictEqual(ok('123456', 's', 'Your code is 123456.'), true);
-  assert.strictEqual(ok('123456', 's', 'Your code is 123456. It expires soon'), true);
-  assert.strictEqual(ok('123456', 's', '123456 - expires in 10 min'), true);
-  assert.strictEqual(ok('123456', 's', 'G-123456 is your Google verification code'), true, 'prefix label');
-  assert.strictEqual(ok('G-123456', 's', 'G-123456 is your Google verification code'), true);
+test('startMonitoring surfaces a push setup failure but still records setup as done', async () => {
+  const env = makeEnv({ subVersion: 2 }, { LanguageModel: mockLanguageModel() });
+  mailFetch(env, { routes: { ...monitoringRoutes, 'https://register.example/': () => jsonResponse({}, 403) } });
+  await assert.rejects(env.sandbox.startMonitoring(), /ALLOWED_EMAILS/);
+  assert.strictEqual(env.storage.setupDone, true, 'the health check keeps repairing push');
+  assert.strictEqual(env.storage.pushActive, false);
+  assert.match(env.storage.pushError, /ALLOWED_EMAILS/);
+  assert.ok(env.fetchLog.some((u) => String(u).includes('/watch')), 'the watch is still attempted');
 });
 
 test('detectorError clears once an engine is usable, even if the backlog never reaches a model', async () => {
   const lm = mockLanguageModel({ availability: 'downloadable' });
   const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm });
-  singleMessageFetch(env, 'd1', 'Your login code is 111111', 'Sign in to Acme');
+  mailFetch(env, { messages: { d1: 'Your login code is 111111' }, subject: 'Sign in to Acme' });
   await firePush(env);
   assert.ok(env.storage.detectorError);
   lm.availabilityValue = 'available';
   // The queued mail is now too old: consumed by the age gate, no model call.
-  env.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '300', history: [] });
-    if (url.includes('/messages/d1')) return jsonResponse({ ...gmailMessage('d1', 'Your login code is 111111'), internalDate: String(Date.now() - 3600000) });
-    throw new Error('unexpected fetch: ' + url);
+  mailFetch(env, {
+    messages: { d1: { ...gmailMessage('d1', 'Your login code is 111111'), internalDate: String(Date.now() - 3600000) } },
+    history: [], historyId: '300',
   });
   await firePush(env);
   assert.strictEqual(lm.prompts.length, 0);
   assert.strictEqual(env.storage.detectorError, null);
   // getStatus clears it too.
   const env2 = makeEnv({ detectorError: { message: 'x', at: 1, nano: 'downloadable' } }, { LanguageModel: mockLanguageModel() });
-  const st = await new Promise((resolve) => { for (const fn of env2.listeners.message) fn({ action: 'getStatus' }, {}, resolve); });
+  const st = await ask(env2, { action: 'getStatus' });
   assert.strictEqual(st.detectorError, null);
 });
 
 test('the download poll alarm notices the model is ready, clears detectorError and drains the queue', async () => {
   const lm = mockLanguageModel({ availability: 'downloading', respond: () => '424242' });
   const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm });
-  singleMessageFetch(env, 'p1', 'Your login code is 424242', 'Sign in to Acme');
+  mailFetch(env, { messages: { p1: 'Your login code is 424242' }, subject: 'Sign in to Acme' });
   await firePush(env);
   assert.ok(env.alarms['nano-ready-poll'], 'polling while Chrome downloads');
   assert.deepStrictEqual(env.storage.pendingMessageIds, ['p1']);
@@ -1314,7 +1277,7 @@ test('the download poll alarm notices the model is ready, clears detectorError a
   assert.strictEqual(env.clipboard, '424242');
   // The popup starts the same poll when its Download button is clicked.
   const env2 = makeEnv({}, { LanguageModel: mockLanguageModel({ availability: 'downloadable' }) });
-  await new Promise((resolve) => { for (const fn of env2.listeners.message) fn({ action: 'watchNanoDownload' }, {}, resolve); });
+  await ask(env2, { action: 'watchNanoDownload' });
   assert.ok(env2.alarms['nano-ready-poll']);
 });
 
@@ -1322,7 +1285,7 @@ test('a failing in-worker Prompt API moves Nano to the offscreen document; repea
   const workerLM = mockLanguageModel({ failPrompts: 99 });
   const pageLM = mockLanguageModel({ respond: () => '515151' });
   const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: workerLM, offscreenLanguageModel: pageLM });
-  singleMessageFetch(env, 'w1', 'Your code is 515151', 'Your code');
+  mailFetch(env, { messages: { w1: 'Your code is 515151' } });
   await firePush(env);
   assert.strictEqual(env.clipboard, '515151', 'retry ran in the offscreen document');
   assert.strictEqual(workerLM.prompts.length, 1);
@@ -1333,71 +1296,19 @@ test('a failing in-worker Prompt API moves Nano to the offscreen document; repea
   const lm = mockLanguageModel({ failPrompts: 99 });
   const env2 = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm });
   for (let i = 0; i < 4; i++) {
-    singleMessageFetch(env2, `z${i}`, 'Your code is 777777', 'Your code');
+    mailFetch(env2, { messages: { [`z${i}`]: 'Your code is 777777' } });
     await firePush(env2);
   }
   assert.deepStrictEqual(env2.storage.pendingMessageIds, [], 'never blocks');
   assert.strictEqual(env2.notifications.filter((n) => n.id === 'nano-failing').length, 1);
-  let st = await new Promise((resolve) => { for (const fn of env2.listeners.message) fn({ action: 'getStatus' }, {}, resolve); });
+  let st = await ask(env2, { action: 'getStatus' });
   assert.strictEqual(st.nanoFailing, true);
   lm.failPrompts = 0;
   lm.availabilityValue = 'available';
-  singleMessageFetch(env2, 'z9', 'Your code is 777777', 'Your code');
+  mailFetch(env2, { messages: { z9: 'Your code is 777777' } });
   await firePush(env2);
-  st = await new Promise((resolve) => { for (const fn of env2.listeners.message) fn({ action: 'getStatus' }, {}, resolve); });
+  st = await ask(env2, { action: 'getStatus' });
   assert.strictEqual(st.nanoFailing, false, 'a success resets the streak');
-});
-
-test('offscreen host: a {error} reply makes the worker retry once, then consume', async () => {
-  const lm = mockLanguageModel({ respond: () => '606060', failPrompts: 1 });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { offscreenLanguageModel: lm });
-  singleMessageFetch(env, 'e1', 'Your code is 606060', 'Your code');
-  await firePush(env);
-  assert.strictEqual(env.clipboard, '606060', 'retried and copied');
-  assert.strictEqual(env.offscreen.received.filter((a) => a === 'nano-detect').length, 2);
-
-  const lm2 = mockLanguageModel({ respond: (t) => (t.includes('717171') ? '717171' : '606060'), failPrompts: 2 });
-  const env2 = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { offscreenLanguageModel: lm2 });
-  env2.setFetch(async (url) => {
-    url = String(url);
-    if (url.includes('/history?')) return jsonResponse({ historyId: '200', history: [{ messagesAdded: [{ message: { id: 'e1' } }, { message: { id: 'e2' } }] }] });
-    if (url.includes('/messages/e1')) return jsonResponse(gmailMessage('e1', 'Your code is 606060'));
-    if (url.includes('/messages/e2')) return jsonResponse(gmailMessage('e2', 'Your code is 717171'));
-    throw new Error('unexpected fetch: ' + url);
-  });
-  await firePush(env2);
-  assert.strictEqual(env2.offscreen.received.filter((a) => a === 'nano-detect').length, 3, 'e1 twice, e2 once');
-  assert.strictEqual(env2.clipboard, '717171', 'e1 consumed, e2 copied');
-  assert.deepStrictEqual(env2.storage.pendingMessageIds, []);
-});
-
-test('nanoBase: a late create() rejection does not evict a newer cached base session', async () => {
-  let rejectFirst;
-  let calls = 0;
-  const lm = mockLanguageModel();
-  const realCreate = lm.create;
-  lm.create = (opts) => {
-    calls++;
-    if (calls === 1) return new Promise((_, reject) => { rejectFirst = reject; });
-    return realCreate(opts);
-  };
-  const env = makeEnv({}, { LanguageModel: lm });
-  const first = env.sandbox.nanoBase();
-  env.sandbox.nanoDropBase(); // e.g. the call timed out
-  const second = env.sandbox.nanoBase();
-  await second;
-  rejectFirst(new Error('late'));
-  await assert.rejects(first, /late/);
-  assert.strictEqual(env.sandbox.nanoBase(), second, 'newer base still cached');
-});
-
-test('nanoExtract releases the base session after an idle period', async () => {
-  const lm = mockLanguageModel({ respond: () => '' });
-  const env = makeEnv({}, { LanguageModel: lm, fireLongTimers: true });
-  await env.sandbox.nanoExtract({ body: 'b' });
-  await new Promise((r) => setImmediate(r));
-  await new Promise((r) => setImmediate(r));
-  assert.strictEqual(lm.destroyed, 2, 'clone and (after idle) base destroyed');
 });
 
 test('ensureOffscreenDocument tolerates losing the creation race', async () => {
@@ -1409,31 +1320,9 @@ test('ensureOffscreenDocument tolerates losing the creation race', async () => {
   await assert.rejects(env.sandbox.ensureOffscreenDocument(), /boom/);
 });
 
-test('install, update and startup delete the legacy cloud API key and its error, and nothing else', async () => {
-  const env = makeEnv({ geminiApiKey: 'AIza-old', geminiError: { message: 'Gemini 402', at: 1 }, lastHistoryId: '5', codeHistory: [] });
-  const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
-  assert.strictEqual(env.listeners.installed.length, 1);
-  assert.strictEqual(env.listeners.startup.length, 1);
-  env.listeners.installed[0]({ reason: 'update' });
-  await flush();
-  assert.ok(!('geminiApiKey' in env.storage) && !('geminiError' in env.storage), 'legacy keys removed');
-  assert.strictEqual(env.storage.lastHistoryId, '5', 'other state kept');
-  assert.ok('codeHistory' in env.storage);
-  assert.strictEqual(env.storageRemoves, 1, 'one storage call');
-  // Idempotent: running again (next Chrome start) is a harmless no-op.
-  env.listeners.startup[0]();
-  await flush();
-  assert.strictEqual(env.storageRemoves, 2);
-  assert.strictEqual(env.storage.lastHistoryId, '5');
-  // A storage failure here must not break startup.
-  env.sandbox.chrome.storage.local.remove = async () => { throw new Error('quota'); };
-  env.listeners.startup[0]();
-  await flush();
-});
-
 test('popup and manifests have no API key field or cloud model host', async () => {
-  const html = fs.readFileSync(path.join(EXT_DIR, 'popup.html'), 'utf8');
-  assert.ok(!/api-key|save-key|type="password"/i.test(html), 'no key input');
+  const page = fs.readFileSync(path.join(EXT_DIR, 'popup.html'), 'utf8');
+  assert.ok(!/api-key|save-key|type="password"/i.test(page), 'no key input');
   for (const f of ['manifest.example.json', 'manifest.json']) {
     const file = path.join(EXT_DIR, f);
     if (!fs.existsSync(file)) continue; // manifest.json is gitignored
@@ -1451,25 +1340,9 @@ test('popup.css keeps the hidden attribute authoritative over .btn display', asy
   assert.match(css, /\[hidden\]\s*\{\s*display:\s*none\s*!important;?\s*\}/);
 });
 
-// Must stay the last test: it checks what every environment above fetched.
+// Must stay the last test (node:test runs top-level tests in order): it checks
+// what every environment above fetched.
 test('no code path in this suite ever fetched generativelanguage.googleapis.com', async () => {
   assert.ok(ALL_FETCHES.length > 50, 'the suite exercised real fetch paths');
   assert.deepStrictEqual(ALL_FETCHES.filter(isCloudModelUrl), []);
 });
-
-// --- Runner ---
-
-(async () => {
-  let failed = 0;
-  for (const [name, fn] of tests) {
-    try {
-      await fn();
-      console.log(`  ✓ ${name}`);
-    } catch (err) {
-      failed++;
-      console.error(`  ✗ ${name}\n    ${err.message}`);
-    }
-  }
-  console.log(`\n${tests.length - failed}/${tests.length} passed`);
-  process.exit(failed ? 1 : 0);
-})();

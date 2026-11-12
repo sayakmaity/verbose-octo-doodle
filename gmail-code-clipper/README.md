@@ -90,7 +90,7 @@ The second argument is a comma-separated allow-list of the Gmail accounts that m
 
 If `.env.yaml` already exists, its VAPID keys are reused. The script refuses to run if the file can't be parsed, rather than silently minting new keys. Pass `--rotate-vapid` as a third argument to deliberately generate new ones (the old file is backed up), then update `VAPID_PUBLIC_KEY` in `config.js` and reload the extension.
 
-This enables all required APIs (Pub/Sub, Cloud Functions, FCM, Firestore, Firebase), creates the Pub/Sub topic, grants Gmail publish access, generates VAPID keys, and deploys two Cloud Functions:
+This enables all required APIs (Pub/Sub, Cloud Functions, Firestore), creates the Pub/Sub topic, grants Gmail publish access, generates VAPID keys, and deploys two Cloud Functions:
 
 - **gmail-push-handler** (Pub/Sub trigger) — receives Gmail notifications, sends Web Push to extension
 - **register-push** (HTTP trigger) — extension calls this, authenticated with its Google token, to register its push subscription (one per device, per account)

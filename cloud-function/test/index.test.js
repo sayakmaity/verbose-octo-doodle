@@ -2,6 +2,7 @@
 // Run: node cloud-function/test/index.test.js
 'use strict';
 const assert = require('assert');
+const { test, beforeEach } = require('node:test');
 const path = require('path');
 const Module = require('module');
 
@@ -106,53 +107,49 @@ async function register(subscription, token) {
   return res;
 }
 
-function pubsubMessage(obj) {
-  return { data: Buffer.from(JSON.stringify(obj)).toString('base64') };
+// A Gmail Pub/Sub notification for that account through the handler.
+function notify(historyId, emailAddress = 'owner@example.com') {
+  const data = Buffer.from(JSON.stringify({ emailAddress, historyId })).toString('base64');
+  return fns.gmailPushHandler({ data });
 }
+
+const sentEndpoints = () => state.sent.map((x) => x.sub.endpoint);
 
 function subsFor(email) {
   return Object.values(state.docs).filter((d) => d.email === email);
 }
 
-const tests = [];
-function test(name, fn) { tests.push([name, () => { state.docs = {}; state.sent = []; state.sendError = null; return fn(); }]); }
+beforeEach(() => { state.docs = {}; state.sent = []; state.sendError = null; });
 
 // --- registerPush ---
 
-test('registerPush stores a valid subscription keyed by the verified email', async () => {
+test('registerPush stores a valid subscription keyed by the verified email, with no permissive CORS', async () => {
   const res = await register(sub('https://push.example/ep'));
   assert.deepStrictEqual(res.body, { success: true });
+  assert.strictEqual(res.headers['Access-Control-Allow-Origin'], undefined);
   const stored = subsFor('owner@example.com');
   assert.strictEqual(stored.length, 1);
   assert.strictEqual(stored[0].subscription.endpoint, 'https://push.example/ep');
 });
 
-test('registerPush rejects requests without a valid token (401)', async () => {
-  assert.strictEqual((await register(sub('https://push.example/ep'), null)).statusCode, 401);
-  assert.strictEqual((await register(sub('https://push.example/ep'), 'forged')).statusCode, 401);
-  assert.strictEqual(Object.keys(state.docs).length, 0);
-});
-
-test('registerPush returns 502 (not 401) when Google itself fails the token lookup', async () => {
-  const res = await register(sub('https://push.example/ep'), 'google-down');
-  assert.strictEqual(res.statusCode, 502);
-});
+// 401 for a missing/invalid token, 502 (not 401) when Google itself fails the
+// lookup, 403 for an account not on the allow-list. Nothing is stored.
+for (const [token, status] of [[null, 401], ['forged', 401], ['google-down', 502], ['other-token', 403]]) {
+  test(`registerPush with token ${token} -> ${status}`, async () => {
+    assert.strictEqual((await register(sub('https://push.example/ep'), token)).statusCode, status);
+    assert.strictEqual(Object.keys(state.docs).length, 0);
+  });
+}
 
 test('legacy config/push subscription still gets pushes until the extension re-registers', async () => {
   state.docs['config/push'] = { subscription: sub('https://push.example/legacy') };
-  await fns.gmailPushHandler(pubsubMessage({ emailAddress: 'owner@example.com', historyId: 7 }));
-  assert.deepStrictEqual(state.sent.map((x) => x.sub.endpoint), ['https://push.example/legacy']);
+  await notify(7);
+  assert.deepStrictEqual(sentEndpoints(), ['https://push.example/legacy']);
   // Once a new-style registration exists, the legacy doc is no longer used.
   state.sent = [];
   await register(sub('https://push.example/new'));
-  await fns.gmailPushHandler(pubsubMessage({ emailAddress: 'owner@example.com', historyId: 8 }));
-  assert.deepStrictEqual(state.sent.map((x) => x.sub.endpoint), ['https://push.example/new']);
-});
-
-test('registerPush rejects accounts not on the allow-list (403)', async () => {
-  const res = await register(sub('https://attacker.example/x'), 'other-token');
-  assert.strictEqual(res.statusCode, 403);
-  assert.strictEqual(Object.keys(state.docs).length, 0);
+  await notify(8);
+  assert.deepStrictEqual(sentEndpoints(), ['https://push.example/new']);
 });
 
 test('registerPush fails closed when ALLOWED_EMAILS is unset', async () => {
@@ -171,17 +168,6 @@ test('registerPush rejects malformed subscriptions', async () => {
   }
 });
 
-test('registerPush has no permissive CORS', async () => {
-  const res = await register(sub('https://push.example/ep'));
-  assert.strictEqual(res.headers['Access-Control-Allow-Origin'], undefined);
-});
-
-test('two devices for the same account both stay registered', async () => {
-  await register(sub('https://push.example/laptop'));
-  await register(sub('https://push.example/desktop'));
-  assert.strictEqual(subsFor('owner@example.com').length, 2);
-});
-
 test('registrations beyond the per-account cap prune the oldest', async () => {
   for (let i = 0; i < 7; i++) {
     state.docs[`pushSubscriptions/old${i}`] = { email: 'owner@example.com', subscription: sub(`https://p/${i}`), updatedAt: i };
@@ -196,8 +182,7 @@ test('registrations beyond the per-account cap prune the oldest', async () => {
 test('registerPush answers staleEndpoint for a dead endpoint; a fresh one registers', async () => {
   await register(sub('https://push.example/dead'));
   state.sendError = Object.assign(new Error('gone'), { statusCode: 410 });
-  await fns.gmailPushHandler(pubsubMessage({ emailAddress: 'owner@example.com', historyId: 1 }));
-  state.sendError = null;
+  await notify(1);
   assert.deepStrictEqual((await register(sub('https://push.example/dead'))).body, { success: false, staleEndpoint: true });
   assert.deepStrictEqual((await register(sub('https://push.example/fresh'))).body, { success: true });
 });
@@ -206,7 +191,7 @@ test('registerPush answers staleEndpoint for a dead endpoint; a fresh one regist
 
 test('gmailPushHandler sends push with TTL, urgency, topic and VAPID details', async () => {
   await register(sub('https://push.example/ep'));
-  await fns.gmailPushHandler(pubsubMessage({ emailAddress: 'owner@example.com', historyId: 12345 }));
+  await notify(12345);
   assert.strictEqual(state.sent.length, 1);
   const { payload, opts } = state.sent[0];
   assert.deepStrictEqual(JSON.parse(payload), { type: 'gmail_update', historyId: '12345' });
@@ -220,22 +205,22 @@ test('gmailPushHandler fans out to every device of that account only', async () 
   await register(sub('https://push.example/laptop'));
   await register(sub('https://push.example/desktop'));
   state.docs['pushSubscriptions/x'] = { email: 'someone@else.com', subscription: sub('https://push.example/other') };
-  await fns.gmailPushHandler(pubsubMessage({ emailAddress: 'Owner@Example.com', historyId: 1 }));
-  assert.deepStrictEqual(state.sent.map((s) => s.sub.endpoint).sort(), ['https://push.example/desktop', 'https://push.example/laptop']);
+  await notify(1, 'Owner@Example.com');
+  assert.deepStrictEqual(sentEndpoints().sort(), ['https://push.example/desktop', 'https://push.example/laptop']);
 });
 
 test('a 410 only marks that endpoint dead and never clobbers a fresh registration', async () => {
   await register(sub('https://push.example/dead'));
   await register(sub('https://push.example/fresh'));
   state.sendError = (s) => (s.endpoint.endsWith('/dead') ? Object.assign(new Error('gone'), { statusCode: 410 }) : null);
-  await fns.gmailPushHandler(pubsubMessage({ emailAddress: 'owner@example.com', historyId: 1 }));
+  await notify(1);
   state.sendError = null;
   const docs = subsFor('owner@example.com');
   assert.strictEqual(docs.find((d) => d.subscription.endpoint.endsWith('/dead')).dead, true);
   assert.strictEqual(docs.find((d) => d.subscription.endpoint.endsWith('/fresh')).dead, false);
   state.sent = [];
-  await fns.gmailPushHandler(pubsubMessage({ emailAddress: 'owner@example.com', historyId: 2 }));
-  assert.deepStrictEqual(state.sent.map((s) => s.sub.endpoint), ['https://push.example/fresh']);
+  await notify(2);
+  assert.deepStrictEqual(sentEndpoints(), ['https://push.example/fresh']);
 });
 
 test('gmailPushHandler survives malformed pubsub data', async () => {
@@ -244,21 +229,6 @@ test('gmailPushHandler survives malformed pubsub data', async () => {
 });
 
 test('gmailPushHandler no-ops when no subscription registered', async () => {
-  await fns.gmailPushHandler(pubsubMessage({ emailAddress: 'owner@example.com', historyId: 2 }));
+  await notify(2);
   assert.strictEqual(state.sent.length, 0);
 });
-
-(async () => {
-  let failed = 0;
-  for (const [name, fn] of tests) {
-    try {
-      await fn();
-      console.log(`  ✓ ${name}`);
-    } catch (err) {
-      failed++;
-      console.error(`  ✗ ${name}\n    ${err.message}`);
-    }
-  }
-  console.log(`\n${tests.length - failed}/${tests.length} passed`);
-  process.exit(failed ? 1 : 0);
-})();

@@ -89,16 +89,6 @@ h1 {
   background: #e5e7eb;
 }
 
-.btn.active {
-  background: #ef4444;
-  color: #fff;
-  border-color: #ef4444;
-}
-
-.btn.active:hover {
-  background: #dc2626;
-}
-
 .btn-row {
   display: flex;
   flex-wrap: wrap;

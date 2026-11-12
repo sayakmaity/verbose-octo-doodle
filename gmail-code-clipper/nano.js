@@ -37,32 +37,6 @@ async function nanoAvailability() {
   }
 }
 
-// One warm base session; each email gets a clone so emails never share
-// context. Dropped after any failure so the next call starts fresh, and after
-// NANO_IDLE_MS without use: the offscreen document lives all browser session,
-// and a live session keeps the model loaded in RAM/VRAM.
-let nanoBasePromise = null;
-let nanoIdleTimer = null;
-const NANO_IDLE_MS = 3 * 60000;
-
-function nanoBase() {
-  if (!nanoBasePromise) {
-    const p = LanguageModel.create(NANO_SESSION_OPTS).catch((err) => {
-      // Only if still cached: a late rejection must not evict a newer base.
-      if (nanoBasePromise === p) nanoBasePromise = null;
-      throw err;
-    });
-    nanoBasePromise = p;
-  }
-  return nanoBasePromise;
-}
-
-function nanoDropBase() {
-  const stale = nanoBasePromise;
-  nanoBasePromise = null;
-  stale?.then((s) => { try { s.destroy(); } catch { /* already gone */ } }, () => {});
-}
-
 function nanoMeasure(session, text, signal) {
   const opts = { responseConstraint: NANO_SCHEMA, signal };
   return session.measureContextUsage
@@ -90,7 +64,6 @@ async function nanoFitBody(session, from, subject, body, signal) {
 // -> { raw, code, truncated }. code is login_code with whitespace removed, or
 // '' when the answer isn't valid JSON. Throws on model errors and timeouts.
 async function nanoExtract({ from = '', subject = '', body = '' } = {}, { timeoutMs = NANO_DEFAULT_TIMEOUT_MS } = {}) {
-  clearTimeout(nanoIdleTimer);
   const ac = new AbortController();
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -102,11 +75,12 @@ async function nanoExtract({ from = '', subject = '', body = '' } = {}, { timeou
     }, timeoutMs);
   });
 
+  // A fresh session per email, so emails never share context and a wedged
+  // session is never reused.
   const work = async () => {
     let session;
     try {
-      const base = await nanoBase();
-      session = await base.clone({ signal: ac.signal });
+      session = await LanguageModel.create({ ...NANO_SESSION_OPTS, signal: ac.signal });
       const fit = await nanoFitBody(session, from, subject, body, ac.signal);
       const raw = await session.prompt(buildCodePrompt(from, subject, fit.body), {
         responseConstraint: NANO_SCHEMA,
@@ -124,12 +98,7 @@ async function nanoExtract({ from = '', subject = '', body = '' } = {}, { timeou
 
   try {
     return await Promise.race([work(), timeout]);
-  } catch (err) {
-    // A wedged or crashed session must not be reused by the next email.
-    nanoDropBase();
-    throw err;
   } finally {
     clearTimeout(timer);
-    nanoIdleTimer = setTimeout(() => { nanoIdleTimer = null; nanoDropBase(); }, NANO_IDLE_MS);
   }
 }

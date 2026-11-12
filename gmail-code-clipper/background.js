@@ -8,9 +8,8 @@ const REGISTER_PUSH_URL = CONFIG.REGISTER_PUSH_URL;
 
 const MAX_PROCESSED_CACHE = 200;
 const HEALTH_CHECK_MINUTES = 30;
-const WATCH_RETRY_MINUTES = 15;
 const WATCH_RENEW_MARGIN_MS = 2 * 3600000;
-// Per-email budget for one on-device run (clone + fit + prompt).
+// Per-email budget for one on-device run (create + fit + prompt).
 const NANO_TIMEOUT_MS = 60000;
 // Login codes expire in minutes. Anything older is never copied: this keeps a
 // backlog drain (Chrome was closed, model still downloading) from putting a
@@ -53,11 +52,10 @@ function restoreState() {
     detectorError = s.detectorError || null;
     pushError = s.pushError || null;
     lastHistoryId = s.lastHistoryId || null;
-    // pushActive fallback migrates installs that predate the setupDone flag.
+    // Installs from before setupDone existed: derive it from pushActive and
+    // persist it, or the first failed repairPush (which writes
+    // pushActive=false) would make a working install look "Not set up".
     setupDone = !!(s.setupDone || s.pushActive);
-    // Installs upgraded from builds without setupDone: persist it, or the
-    // first failed repairPush (which now writes pushActive=false) would make
-    // a working install look "Not set up" and disable the health check.
     if (setupDone && !s.setupDone) await chrome.storage.local.set({ setupDone: true });
     pushActive = !!s.pushActive;
     needsAuth = !!s.needsAuth;
@@ -90,17 +88,8 @@ async function advanceCursor(newId) {
 
 // --- Lifecycle ---
 
-chrome.runtime.onInstalled.addListener(() => { removeLegacyCloudState(); fullRestore(); });
-chrome.runtime.onStartup.addListener(() => { removeLegacyCloudState(); fullRestore(); });
-
-// Older builds had an optional cloud Gemini fallback with an API key stored
-// here. Nothing reads these any more; delete them so a stored key is never
-// kept around (and never used). Removing absent keys is a no-op, so running
-// on every install/update/startup is idempotent and costs one storage call.
-function removeLegacyCloudState() {
-  return chrome.storage.local.remove(['geminiApiKey', 'geminiError'])
-    .catch((err) => console.warn('Removing legacy cloud settings failed:', err?.message));
-}
+chrome.runtime.onInstalled.addListener(() => fullRestore());
+chrome.runtime.onStartup.addListener(() => fullRestore());
 
 async function fullRestore() {
   await restoreState();
@@ -111,25 +100,21 @@ async function fullRestore() {
   // Notifications don't survive a Chrome restart; re-raise the only recovery
   // signal the user has.
   if (needsAuth) await flagNeedsAuth(true);
-  // Drain first-class: emails that arrived while Chrome was closed are
-  // recoverable from the old cursor. Never reset the cursor here. The repairs
-  // are independent — one failing must not block the others.
-  await Promise.allSettled([
-    checkForNewEmails().catch((err) => console.warn('Startup drain failed:', err.message)),
-    repairPush(),
-  ]);
+  // Emails that arrived while Chrome was closed drain from the old cursor
+  // (never reset it here); push is repaired alongside.
+  await healthCheck();
 }
 
+// Null prototype: an alarm named e.g. 'toString' must not match.
+const ALARM_HANDLERS = { __proto__: null, 'health-check': healthCheck, 'nano-ready-poll': pollNanoReady };
+
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'gmail-watch-renew') {
-    restoreState().then(() => renewWatchWithRetry()).catch(console.error);
-  } else if (alarm.name === 'health-check') {
-    restoreState().then(() => healthCheck()).catch(console.error);
-  } else if (alarm.name === 'badge-clear') {
+  if (alarm.name === 'badge-clear') {
     chrome.action.setBadgeText({ text: '' });
-  } else if (alarm.name === 'nano-ready-poll') {
-    restoreState().then(() => pollNanoReady()).catch(console.error);
+    return;
   }
+  const run = ALARM_HANDLERS[alarm.name];
+  if (run) restoreState().then(() => run()).catch(console.error);
 });
 
 async function ensureHealthCheckAlarm() {
@@ -154,11 +139,14 @@ async function healthCheck() {
   }
 }
 
-// Re-registers the push subscription and renews the watch if needed, and
-// records the real outcome in pushActive so the popup reflects push health in
-// both directions (it used to be written only by startMonitoring).
-async function repairPush() {
-  const results = await Promise.allSettled([registerPushSubscription(), ensureWatch()]);
+// Re-registers the push subscription and renews the watch if needed (always,
+// with forceWatch), and records the real outcome in pushActive for the popup.
+// The watch is renewed only here: the health check runs well before expiry.
+async function repairPush(forceWatch = false) {
+  const results = await Promise.allSettled([
+    registerPushSubscription(),
+    forceWatch ? setupGmailWatch() : ensureWatch(),
+  ]);
   const failure = results.find((r) => r.status === 'rejected');
   for (const r of results) {
     if (r.status === 'rejected') console.warn('Push repair step failed:', r.reason?.message);
@@ -173,15 +161,6 @@ async function setPushState(ok, errorMessage) {
   pushActive = ok;
   pushError = ok ? null : (errorMessage || 'Push setup failed');
   await chrome.storage.local.set({ pushActive, pushError });
-}
-
-async function renewWatchWithRetry() {
-  try {
-    await setupGmailWatch();
-  } catch (err) {
-    console.warn('Watch renewal failed, retrying in', WATCH_RETRY_MINUTES, 'min:', err.message);
-    chrome.alarms.create('gmail-watch-renew', { delayInMinutes: WATCH_RETRY_MINUTES });
-  }
 }
 
 // --- Web Push ---
@@ -256,20 +235,11 @@ async function registerPushSubscription() {
     // The server authenticates registrations with this token (it resolves the
     // Gmail address and checks an allow-list), so nobody else can hijack the
     // push channel by POSTing their own subscription.
-    const post = (token) => fetch(REGISTER_PUSH_URL, {
+    const resp = await authedFetch(REGISTER_PUSH_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ subscription: subscription.toJSON() }),
     });
-    let token = await getTokenSilent();
-    let resp = await post(token);
-    if (resp.status === 401) {
-      // Chrome may hand back a cached token Google no longer accepts: evict it
-      // and retry once with a fresh one (same as fetchGmailApi does).
-      await new Promise((r) => chrome.identity.removeCachedAuthToken({ token }, r));
-      token = await getTokenSilent();
-      resp = await post(token);
-    }
     if (resp.status === 403) {
       throw new Error('Push server rejected this Google account — add it to ALLOWED_EMAILS and redeploy');
     }
@@ -297,61 +267,39 @@ async function ensureWatch() {
   }
 }
 
+// Never touches the cursor: only a drain or startMonitoring moves it.
 async function setupGmailWatch() {
-  const token = await getTokenSilent();
-  const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/watch', {
+  const result = await fetchGmailApi('users/me/watch', {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      topicName: GCP_TOPIC_NAME,
-      labelIds: ['INBOX'],
-    }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ topicName: GCP_TOPIC_NAME, labelIds: ['INBOX'] }),
+  }).catch((err) => {
+    // Say which step failed: this text is shown in the popup as pushError.
+    throw new Error(`Gmail watch failed: ${err.message}`);
   });
-
-  if (!response.ok) {
-    throw new Error(`Gmail watch failed: ${response.status} ${await response.text()}`);
-  }
-
-  const result = await response.json();
-  // Only adopt the watch historyId when we have no cursor at all. Overwriting
-  // an existing cursor would skip every email that arrived since the last
-  // processed message (e.g. while Chrome was closed).
-  if (!lastHistoryId) {
-    await advanceCursor(result.historyId);
-  }
   watchExpiration = Number(result.expiration);
   await chrome.storage.local.set({ watchExpiration });
-
-  // Renew 1 hour before expiry
-  const renewInMs = Math.max(watchExpiration - Date.now() - 3600000, 60000);
-  chrome.alarms.create('gmail-watch-renew', { delayInMinutes: renewInMs / 60000 });
   console.log('Gmail watch active, expires:', new Date(watchExpiration).toISOString());
   return result;
 }
 
 // --- Message handling from popup / notification ---
 
+// Popup commands answered with { success, error? }. Null prototype: an
+// action like 'toString' is not a command.
+const COMMANDS = {
+  __proto__: null,
+  startMonitoring,
+  // Before setup there's no grant yet: draining would raise a bogus
+  // "needs re-authorization" alert for a brand-new user.
+  checkNow: () => restoreState().then(() => (setupDone ? checkForNewEmails() : undefined)),
+  watchNanoDownload,
+};
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.action === 'startMonitoring') {
-    startMonitoring()
-      .then(() => sendResponse({ success: true }))
-      .catch((err) => sendResponse({ success: false, error: err.message }));
-    return true;
-  }
-  if (message.action === 'checkNow') {
-    restoreState()
-      // Before setup there's no grant yet: draining would raise a bogus
-      // "needs re-authorization" alert for a brand-new user.
-      .then(() => (setupDone ? checkForNewEmails() : undefined))
-      .then(() => sendResponse({ success: true }))
-      .catch((err) => sendResponse({ success: false, error: err.message }));
-    return true;
-  }
-  if (message.action === 'watchNanoDownload') {
-    watchNanoDownload()
+  const command = COMMANDS[message.action];
+  if (command) {
+    command()
       .then(() => sendResponse({ success: true }))
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
@@ -359,18 +307,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'getStatus') {
     restoreState()
       .then(async () => {
-        const { engine, nanoAvailability } = await engineStatus();
-        if (engine !== 'none') await clearDetectorError();
+        // 'unknown' when the model host didn't answer: not evidence of no model.
+        const nanoAvailability = await getNanoAvailability().catch(() => 'unknown');
+        if (nanoAvailability === 'available') await clearDetectorError();
         const { nanoFailStreak = 0 } = await chrome.storage.local.get('nanoFailStreak');
         sendResponse({
           setupDone, pushActive, needsAuth, pushError,
-          engine, nanoAvailability, detectorError,
+          nanoAvailability, detectorError,
           nanoFailing: nanoFailStreak >= NANO_FAIL_ALERT_STREAK,
         });
       })
-      .catch((err) => sendResponse({ setupDone: false, pushActive: false, needsAuth: false, error: err.message }));
+      .catch((err) => sendResponse({ error: err.message }));
     return true;
   }
+  // Every other action (clipboard-write, nano-*, codeDetected) is for other
+  // listeners: don't pre-empt their sendResponse.
   return false;
 });
 
@@ -405,8 +356,7 @@ async function startMonitoring() {
   // backlog instead of discarding it. interactive=true lets the 401-retry
   // prompt when the grant expired but a stale access token was cached.
   if (!lastHistoryId) {
-    const token = await getAuthToken(true);
-    const profile = await fetchGmailApi(token, 'users/me/profile', true);
+    const profile = await fetchGmailApi('users/me/profile', undefined, true);
     await advanceCursor(profile.historyId);
     console.log('Monitoring started, historyId:', lastHistoryId);
   } else {
@@ -419,16 +369,9 @@ async function startMonitoring() {
   await chrome.storage.local.set({ setupDone: true });
   await ensureHealthCheckAlarm();
 
-  try {
-    await registerPushSubscription();
-    await setupGmailWatch();
-    await setPushState(true);
-    console.log('Push mode active');
-  } catch (err) {
-    console.error('Push setup failed (health check will retry):', err.message);
-    await setPushState(false, err.message);
-    throw err;
-  }
+  // A click on Start always re-creates the watch. On failure the health
+  // check keeps retrying; the popup shows the first failing step.
+  if (!(await repairPush(true))) throw new Error(pushError);
 }
 
 async function interactiveRecover() {
@@ -445,9 +388,9 @@ async function interactiveRecover() {
   console.log('Re-authorization successful');
   // Auth is fixed. Failures past this point are push/network problems, not
   // auth problems — don't misreport them as "needs re-authorization"; the
-  // health check keeps repairing them.
-  await checkForNewEmails().catch((err) => console.warn('Post-auth drain failed:', err.message));
-  await repairPush();
+  // health check keeps repairing them. Mail that arrived meanwhile drains from
+  // the old cursor.
+  await healthCheck();
 }
 
 // --- Gmail Auth ---
@@ -486,10 +429,9 @@ function isTransientAuthError(err) {
 }
 
 async function flagNeedsAuth(force = false) {
-  // Only (re)create the notification on the transition into needsAuth, or when
-  // forced (startup — notifications don't survive Chrome restarts — and the
-  // click-then-fail path). Re-creating on every failed background call made it
-  // pop up again on every inbox change.
+  // Only on the transition into needsAuth, or when forced (startup, click-then-
+  // fail). Re-creating it on every failed background call made it pop up again
+  // on every inbox change.
   if (needsAuth && !force) return;
   if (!needsAuth) {
     needsAuth = true;
@@ -519,19 +461,22 @@ class GmailApiError extends Error {
   }
 }
 
-async function fetchGmailApi(token, endpoint, interactive = false) {
-  let response = await fetch(`https://gmail.googleapis.com/gmail/v1/${endpoint}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
+// fetch with the user's Google token. Chrome may hand back a cached token
+// Google no longer accepts: on 401, evict it and retry once with a fresh one.
+async function authedFetch(url, init = {}, interactive = false) {
+  const getToken = () => (interactive ? getAuthToken(true) : getTokenSilent());
+  const send = (token) => fetch(url, { ...init, headers: { ...init.headers, Authorization: `Bearer ${token}` } });
+  const token = await getToken();
+  let response = await send(token);
   if (response.status === 401) {
     await new Promise((r) => chrome.identity.removeCachedAuthToken({ token }, r));
-    const newToken = interactive ? await getAuthToken(true) : await getTokenSilent();
-    response = await fetch(`https://gmail.googleapis.com/gmail/v1/${endpoint}`, {
-      headers: { Authorization: `Bearer ${newToken}` },
-    });
+    response = await send(await getToken());
   }
+  return response;
+}
 
+async function fetchGmailApi(endpoint, init, interactive = false) {
+  const response = await authedFetch(`https://gmail.googleapis.com/gmail/v1/${endpoint}`, init, interactive);
   noteServerTime(response);
   if (!response.ok) {
     throw new GmailApiError(response.status, await response.text());
@@ -580,29 +525,27 @@ function isCursorError(err) {
 }
 
 async function drainOnce() {
-  const token = await getTokenSilent();
-
   if (!lastHistoryId) {
     // No cursor (fresh install, cleared storage). The push that woke us was
     // caused by a real email — grab the most recent inbox messages so it
     // isn't dropped, then start the cursor from "now".
-    await recoverFromRecentMessages(token);
+    await recoverFromRecentMessages();
   } else {
     try {
-      await listNewMessages(token);
+      await listNewMessages();
     } catch (err) {
       if (isCursorError(err)) {
         // Cursor expired (Gmail keeps history ~a week, sometimes less).
         // Docs say to full-sync: fetch recent messages, then reset cursor.
         console.warn('History cursor expired — recovering via recent messages');
-        await recoverFromRecentMessages(token);
+        await recoverFromRecentMessages();
       } else {
         throw err;
       }
     }
   }
 
-  await processPendingQueue(token);
+  await processPendingQueue();
 }
 
 // Enqueue durably BEFORE the cursor advances past these ids: if we die
@@ -624,7 +567,7 @@ async function enqueueMessageIds(ids) {
   }
 }
 
-async function listNewMessages(token) {
+async function listNewMessages() {
   let pageToken = null;
   let latestHistoryId = null;
   const newIds = [];
@@ -639,7 +582,7 @@ async function listNewMessages(token) {
     params.append('historyTypes', 'messageAdded');
     params.append('historyTypes', 'labelAdded');
     if (pageToken) params.set('pageToken', pageToken);
-    const history = await fetchGmailApi(token, `users/me/history?${params}`);
+    const history = await fetchGmailApi(`users/me/history?${params}`);
 
     latestHistoryId = history.historyId || latestHistoryId;
     for (const h of history.history || []) {
@@ -665,23 +608,23 @@ async function listNewMessages(token) {
 //     retries recovery instead of skipping the email that woke us.
 //  3. Enqueue oldest-first, so when a code was re-sent the newest one is
 //     copied last and stays on the clipboard.
-async function recoverFromRecentMessages(token) {
-  const profile = await fetchGmailApi(token, 'users/me/profile');
+async function recoverFromRecentMessages() {
+  const profile = await fetchGmailApi('users/me/profile');
   // Only the last hour matters — older login codes are dead (and
   // MAX_CODE_AGE_MS filters further when processing).
   const q = encodeURIComponent('in:inbox newer_than:1h');
-  const list = await fetchGmailApi(token, `users/me/messages?q=${q}&maxResults=10`);
+  const list = await fetchGmailApi(`users/me/messages?q=${q}&maxResults=10`);
   await enqueueMessageIds((list.messages || []).map((m) => m.id).reverse());
   lastHistoryId = String(profile.historyId);
   await chrome.storage.local.set({ lastHistoryId });
 }
 
-async function processPendingQueue(token) {
-  await clearDetectorErrorIfEngine();
+async function processPendingQueue() {
+  await clearDetectorErrorIfReady();
   while (pendingMessageIds.length) {
     const msgId = pendingMessageIds[0];
     try {
-      await processMessage(token, msgId);
+      await processMessage(msgId);
     } catch (err) {
       if (err instanceof GmailApiError && err.status === 404) {
         // Message deleted between listing and fetch — drop it.
@@ -711,8 +654,8 @@ async function processPendingQueue(token) {
 
 // --- Process a single message ---
 
-async function processMessage(token, messageId) {
-  const message = await fetchGmailApi(token, `users/me/messages/${messageId}?format=full`);
+async function processMessage(messageId) {
+  const message = await fetchGmailApi(`users/me/messages/${messageId}?format=full`);
 
   const ageMs = Date.now() + serverClockOffsetMs - receivedAt(message);
   if (ageMs > MAX_CODE_AGE_MS) {
@@ -935,54 +878,41 @@ function looksLikeCodeEmail(subject, body) {
   return CODE_SUBJECT_RE.test(subject) && !VERIFIED_DONE_RE.test(subject);
 }
 
-// --- Engine selection ---
+// --- Code detection ---
 
 // Gemini Nano, Chrome's on-device model, is the only engine: the email text
-// never leaves the machine.
+// never leaves the machine. -> a grounded code, or null.
 async function detectCode(subject, from, body) {
   const nano = await getNanoAvailability().catch((err) => {
     console.warn('On-device model host unreachable:', err.message);
     return null;
   });
-
-  if (nano === 'available') {
-    try {
-      return await detectCodeWithNanoAndRecord(subject, from, body);
-    } catch (err) {
-      // ~3% of runs throw a generic UnknownError (none seen on code emails).
-      console.warn('Gemini Nano failed, retrying with a fresh session:', err.message);
-    }
-    // nano.js dropped the failed base session, so this runs on a fresh one
-    // (in the offscreen document if the worker's Prompt API just failed).
-    try {
-      return await detectCodeWithNanoAndRecord(subject, from, body);
-    } catch (err) {
-      // One bad email must not block the queue: consume it.
-      console.warn('Gemini Nano failed twice, skipping this message:', err.message);
-      await noteNanoFailure();
-      return null;
-    }
-  }
-
   // Host unreachable (offscreen document didn't answer): transient, retry the
   // drain later rather than reporting a missing model.
-  if (nano === null) throw new RetryableError('On-device model host unreachable');
-  throw new DetectorUnavailableError(nano);
-}
+  if (nano === null) throw new Error('On-device model host unreachable');
+  if (nano !== 'available') throw new DetectorUnavailableError(nano);
 
-async function detectCodeWithNanoAndRecord(subject, from, body) {
-  const code = await detectCodeWithNano(subject, from, body);
-  await clearDetectorError();
-  await noteNanoSuccess();
-  return code;
-}
-
-async function detectCodeWithNano(subject, from, body) {
-  const { code, truncated } = await runNano({ from, subject, body }, NANO_TIMEOUT_MS);
-  if (truncated) console.log('Email body truncated to fit the on-device model context');
-  if (isPlausibleCode(code, subject, body)) return code;
-  if (code) console.warn(`Discarding implausible code from Gemini Nano (${code.length} chars)`);
-  return null;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const { code, truncated } = await runNano({ from, subject, body }, NANO_TIMEOUT_MS);
+      await noteNanoSuccess();
+      if (truncated) console.log('Email body truncated to fit the on-device model context');
+      if (isPlausibleCode(code, subject, body)) return code;
+      if (code) console.warn(`Discarding implausible code from Gemini Nano (${code.length} chars)`);
+      return null;
+    } catch (err) {
+      if (attempt === 2) {
+        // One bad email must not block the queue: consume it.
+        console.warn('Gemini Nano failed twice, skipping this message:', err.message);
+        await noteNanoFailure();
+        return null;
+      }
+      // ~3% of runs throw a generic UnknownError (none seen on code emails).
+      // The retry gets a fresh session (in the offscreen document if the
+      // worker's Prompt API just failed).
+      console.warn('Gemini Nano failed, retrying with a fresh session:', err.message);
+    }
+  }
 }
 
 // Consecutive code emails Nano failed on twice (persisted: the worker rarely
@@ -1012,19 +942,7 @@ async function noteNanoSuccess() {
   chrome.notifications.clear('nano-failing');
 }
 
-// Which engine runs right now, for the popup. 'unknown' when the model host
-// (offscreen document) didn't answer: not evidence that there's no model.
-async function engineStatus() {
-  const nanoAvailability = await getNanoAvailability().catch(() => 'unknown');
-  const engine = nanoAvailability === 'available' ? 'nano' : 'none';
-  return { engine, nanoAvailability };
-}
-
 const NANO_UNAVAILABLE_MESSAGE = "Chrome's on-device model (Gemini Nano) can't run here — it needs Chrome 138+ on a supported device";
-
-// Transient failure (model host unreachable): keep the message queued and
-// retry on the next drain.
-class RetryableError extends Error {}
 
 // The on-device model isn't ready (not downloaded yet) or can't run here.
 class DetectorUnavailableError extends Error {
@@ -1065,12 +983,11 @@ async function clearDetectorError() {
   chrome.notifications.clear('detector-error');
 }
 
-// Fixing "no engine" (model downloaded) must clear the error even
-// when nothing queued reaches a model (aged out, filtered by the gate).
-async function clearDetectorErrorIfEngine() {
+// Once the model is ready, clear the error even when nothing queued reaches
+// it (aged out, filtered by the gate).
+async function clearDetectorErrorIfReady() {
   if (!detectorError) return;
-  const { engine } = await engineStatus();
-  if (engine !== 'none') await clearDetectorError();
+  if ((await getNanoAvailability().catch(() => null)) === 'available') await clearDetectorError();
 }
 
 // The popup starts the download (it needs a user click) but closes long before
@@ -1244,19 +1161,9 @@ async function ensureOffscreenDocument() {
 
 async function copyToClipboard(text) {
   try {
-    await ensureOffscreenDocument();
-    // Retry instead of a fixed delay: the document's listener may not be
-    // registered yet on the first attempt.
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const resp = await chrome.runtime.sendMessage({ action: 'clipboard-write', text });
-        if (resp?.copied) return true;
-      } catch { /* receiving end not ready yet */ }
-      await sleep(150);
-    }
-    console.error('Clipboard copy failed after retries');
+    return !!(await offscreenRequest({ action: 'clipboard-write', text })).copied;
   } catch (err) {
-    console.error('Clipboard copy failed:', err);
+    console.error('Clipboard copy failed:', err.message);
+    return false;
   }
-  return false;
 }

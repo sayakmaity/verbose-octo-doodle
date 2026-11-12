@@ -32,19 +32,11 @@ gcloud services enable \
   gmail.googleapis.com \
   cloudfunctions.googleapis.com \
   pubsub.googleapis.com \
-  fcm.googleapis.com \
   run.googleapis.com \
   cloudbuild.googleapis.com \
   eventarc.googleapis.com \
-  firebase.googleapis.com \
   firestore.googleapis.com \
   --project="$PROJECT_ID"
-
-echo "==> Adding Firebase to the project..."
-curl -s -X POST "https://firebase.googleapis.com/v1beta1/projects/$PROJECT_ID:addFirebase" \
-  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-  -H "X-Goog-User-Project: $PROJECT_ID" \
-  -H "Content-Type: application/json" || true
 
 # Check existence explicitly instead of treating every create failure as
 # "already exists" (which hid real errors like missing permissions).

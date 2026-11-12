@@ -5,46 +5,42 @@ const historyEl = document.getElementById('history');
 const statusNote = document.getElementById('status-note');
 const downloadBtn = document.getElementById('download-btn');
 
+// sendMessage rejects when nothing answers; fold that into the background's
+// own { success: false, error } reply shape.
+const send = (action) => chrome.runtime.sendMessage({ action })
+  .catch((err) => ({ success: false, error: err.message }));
+
 // --- Init ---
 
 refreshStatus();
 
 loadHistory();
 
-let lastStatus = {};
-
-function refreshStatus() {
-  chrome.runtime.sendMessage({ action: 'getStatus' }, (response) => {
-    if (chrome.runtime.lastError || !response) {
-      statusDot.className = 'dot warn';
-      statusText.textContent = 'Extension busy — reopen popup';
-      return;
-    }
-    lastStatus = response;
-    updateUI(response);
-  });
+async function refreshStatus() {
+  const response = await send('getStatus');
+  if (!response || response.error) {
+    statusDot.className = 'dot warn';
+    statusText.textContent = 'Extension busy — reopen popup';
+    return;
+  }
+  updateUI(response);
 }
 
 // --- Setup ---
 
 let btnAction = 'startMonitoring';
 
-setupBtn.addEventListener('click', () => {
+setupBtn.addEventListener('click', async () => {
   setupBtn.disabled = true;
   const action = btnAction;
   setupBtn.textContent = action === 'checkNow' ? 'Checking...' : 'Setting up...';
-  chrome.runtime.sendMessage({ action }, (result) => {
-    if (chrome.runtime.lastError || !result) {
-      showToast(chrome.runtime.lastError?.message || 'No response — try again');
-    } else if (!result.success) {
-      showToast(result.error || 'Failed');
-    } else if (action === 'checkNow') {
-      showToast('Checked');
-    }
-    refreshStatus();
-    loadHistory();
-    setupBtn.disabled = false;
-  });
+  const result = await send(action);
+  if (!result) showToast('No response — try again');
+  else if (!result.success) showToast(result.error || 'Failed');
+  else if (action === 'checkNow') showToast('Checked');
+  refreshStatus();
+  loadHistory();
+  setupBtn.disabled = false;
 });
 
 // Why the on-device model can't run right now, and what to do about it.
@@ -64,54 +60,34 @@ function setNote(text) {
   statusNote.hidden = !text;
 }
 
-function updateUI({ setupDone, pushActive, needsAuth, pushError, engine, nanoAvailability, nanoFailing }) {
-  setupBtn.style.display = '';
+const SET_UP = ['startMonitoring', 'Set Up Monitoring'];
+const CHECK_NOW = ['checkNow', 'Check Now'];
+
+function updateUI({ setupDone, pushActive, needsAuth, pushError, nanoAvailability, nanoFailing }) {
   updateDownloadButton(nanoAvailability);
   const cantRun = nanoAvailability === 'unavailable' || nanoAvailability === 'unsupported';
   setNote(cantRun ? REQUIREMENTS_NOTE : '');
-  if (needsAuth) {
+  const noModel = nanoAvailability !== 'available';
+  // [dot, status text, button action, button label]
+  const [dot, text, action, label] =
     // First: nothing else can recover until the Google grant is renewed.
-    statusDot.className = 'dot warn';
-    statusText.textContent = 'Needs re-authorization';
-    btnAction = 'startMonitoring';
-    setupBtn.textContent = 'Re-authorize';
-  } else if (setupDone && engine === 'none') {
-    // No engine: codes are NOT being copied (mail stays queued), even though
+    needsAuth ? ['warn', 'Needs re-authorization', 'startMonitoring', 'Re-authorize']
+    : !setupDone ? (noModel
+      ? ['warn', `Not set up. ${noEngineReason(nanoAvailability)}`, ...SET_UP]
+      : ['off', 'Not set up · will use on-device (Gemini Nano)', ...SET_UP])
+    // No model: codes are NOT being copied (mail stays queued), even though
     // Gmail monitoring is fine. Never show green here.
-    statusDot.className = 'dot warn';
-    statusText.textContent = noEngineReason(nanoAvailability);
-    btnAction = 'checkNow';
-    setupBtn.textContent = 'Check Now';
-  } else if (setupDone && nanoFailing) {
+    : noModel ? ['warn', noEngineReason(nanoAvailability), ...CHECK_NOW]
     // Nano reports ready but keeps failing: code emails are being skipped.
-    statusDot.className = 'dot warn';
-    statusText.textContent = "On-device model keeps failing — recent codes weren't copied. Check chrome://on-device-internals or restart Chrome.";
-    btnAction = 'checkNow';
-    setupBtn.textContent = 'Check Now';
-  } else if (setupDone && pushActive) {
-    statusDot.className = 'dot on';
-    statusText.textContent = 'Active · on-device (Gemini Nano)';
-    btnAction = 'checkNow';
-    setupBtn.textContent = 'Check Now';
-  } else if (setupDone) {
-    statusDot.className = 'dot warn';
-    statusText.textContent = pushError
+    : nanoFailing ? ['warn', "On-device model keeps failing — recent codes weren't copied. Check chrome://on-device-internals or restart Chrome.", ...CHECK_NOW]
+    : pushActive ? ['on', 'Active · on-device (Gemini Nano)', ...CHECK_NOW]
+    : ['warn', pushError
       ? `Push degraded — ${pushError} (checking every 30 min meanwhile)`
-      : 'Active (push degraded — self-healing)';
-    btnAction = 'startMonitoring';
-    setupBtn.textContent = 'Retry Setup';
-  } else if (engine === 'none') {
-    // Not set up AND the model can't detect codes yet: say why, in yellow.
-    statusDot.className = 'dot warn';
-    statusText.textContent = `Not set up. ${noEngineReason(nanoAvailability)}`;
-    btnAction = 'startMonitoring';
-    setupBtn.textContent = 'Set Up Monitoring';
-  } else {
-    statusDot.className = 'dot off';
-    statusText.textContent = 'Not set up · will use on-device (Gemini Nano)';
-    btnAction = 'startMonitoring';
-    setupBtn.textContent = 'Set Up Monitoring';
-  }
+      : 'Active (push degraded — self-healing)', 'startMonitoring', 'Retry Setup'];
+  statusDot.className = `dot ${dot}`;
+  statusText.textContent = text;
+  btnAction = action;
+  setupBtn.textContent = label;
 }
 
 // --- On-device model download ---
@@ -136,7 +112,7 @@ downloadBtn.addEventListener('click', async () => {
   downloadBtn.textContent = 'Downloading… 0%';
   // The popup closes on blur long before a multi-GB download ends; the
   // background polls and retries the queue once the model is ready.
-  chrome.runtime.sendMessage({ action: 'watchNanoDownload' }, () => { void chrome.runtime.lastError; });
+  send('watchNanoDownload');
   try {
     const session = await LanguageModel.create({
       ...NANO_SESSION_OPTS,
@@ -153,16 +129,11 @@ downloadBtn.addEventListener('click', async () => {
   } finally {
     downloading = false;
   }
-  // Retry anything queued while the model wasn't ready.
-  if (lastStatus.setupDone) {
-    chrome.runtime.sendMessage({ action: 'checkNow' }, () => {
-      void chrome.runtime.lastError;
-      refreshStatus();
-      loadHistory();
-    });
-  } else {
-    refreshStatus();
-  }
+  // Retry anything queued while the model wasn't ready (the background
+  // ignores this before setup).
+  await send('checkNow');
+  refreshStatus();
+  loadHistory();
 });
 
 // --- History ---
