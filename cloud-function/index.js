@@ -155,14 +155,6 @@ exports.gmailPushHandler = async (pubsubMessage) => {
   const snap = await db.collection(SUBSCRIPTIONS).where('email', '==', email).get();
   const live = snap.docs.filter((d) => !d.data().dead && d.data().subscription);
   if (!live.length) {
-    // Migration fallback: before per-account subscriptions, the one
-    // subscription lived in config/push. Keep delivering to it until the
-    // extension (reloaded with the token-sending build) re-registers.
-    const legacy = await db.collection('config').doc('push').get();
-    const legacySub = legacy.exists ? legacy.data().subscription : null;
-    if (legacySub) live.push({ data: () => ({ subscription: legacySub }), ref: null, legacy: true });
-  }
-  if (!live.length) {
     console.warn('No live push subscription for this account — the extension registers on setup/health check');
     return;
   }
@@ -183,7 +175,7 @@ exports.gmailPushHandler = async (pubsubMessage) => {
       await webpush.sendNotification(doc.data().subscription, payload, options);
       console.log('Push notification sent');
     } catch (err) {
-      if ((err.statusCode === 404 || err.statusCode === 410) && doc.ref) {
+      if (err.statusCode === 404 || err.statusCode === 410) {
         // Dead endpoint. Marking THIS endpoint's own doc can't clobber a
         // freshly registered subscription (that's a different endpoint/doc).
         console.warn('Subscription gone (HTTP', err.statusCode, ') — marking dead');
