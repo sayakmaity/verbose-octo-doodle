@@ -14,10 +14,11 @@ const EXT_DIR = path.join(__dirname, '..');
 // Mock Prompt API (global LanguageModel). respond(promptText) -> login_code;
 // measure(text) -> tokens (default: proportional to length). failPrompts:
 // how many upcoming prompt() calls throw a generic UnknownError. hang: prompt()
-// never settles until aborted.
+// never settles until aborted. onPrompt() runs at the start of every prompt(),
+// whether it then resolves, throws or hangs.
 function mockLanguageModel({
   availability = 'available', respond = () => '', measure = (t) => Math.ceil(t.length / 4),
-  contextWindow = 9216, failPrompts = 0, hang = false,
+  contextWindow = 9216, failPrompts = 0, hang = false, onPrompt = () => {},
 } = {}) {
   const lm = {
     availabilityValue: availability, failPrompts, hang,
@@ -33,6 +34,7 @@ function mockLanguageModel({
       prompt: (text, opts) => {
         lm.prompts.push(text);
         lm.promptOpts.push(opts);
+        onPrompt(text);
         if (lm.hang) {
           return new Promise((_, reject) => opts.signal.addEventListener('abort', () => reject(opts.signal.reason)));
         }
@@ -47,29 +49,25 @@ function mockLanguageModel({
   return lm;
 }
 
-// A second vm context running the real offscreen.html scripts (nano.js +
-// offscreen.js) with its own LanguageModel; the worker's sendMessage is routed
-// to its listeners the way Chrome would.
-function makeOffscreen(LanguageModel) {
+// A second vm context running the real offscreen.html script (offscreen.js);
+// send() delivers a message to its listeners the way Chrome would.
+function makeOffscreen() {
   const listeners = [];
+  const textarea = { value: '', select() {} };
   const sb = {
     console: { log: () => {}, warn: () => {}, error: () => {} },
     chrome: { runtime: { onMessage: { addListener: (fn) => listeners.push(fn) } } },
     document: {
-      getElementById: () => ({ value: '', select() {} }),
+      getElementById: () => textarea,
       execCommand: () => true,
     },
-    setTimeout: () => 0, clearTimeout: () => {}, AbortController, JSON, String, Promise, Error, Math,
   };
-  if (LanguageModel) sb.LanguageModel = LanguageModel;
   sb.globalThis = sb;
   vm.createContext(sb);
-  for (const f of ['nano.js', 'offscreen.js']) vm.runInContext(fs.readFileSync(path.join(EXT_DIR, f), 'utf8'), sb);
-  const received = [];
+  vm.runInContext(fs.readFileSync(path.join(EXT_DIR, 'offscreen.js'), 'utf8'), sb);
   return {
-    received,
+    textarea,
     send(msg) {
-      received.push(msg.action);
       return new Promise((resolve) => {
         let answered = false;
         const reply = (r) => { answered = true; resolve(r); };
@@ -81,9 +79,10 @@ function makeOffscreen(LanguageModel) {
   };
 }
 
-// Every URL any test environment fetched, for the suite-wide "never calls a
-// cloud model" check at the end.
+// Every URL any test environment fetched and every runtime message it sent,
+// for the suite-wide checks at the end.
 const ALL_FETCHES = [];
+const ALL_SENT = [];
 
 function makeEnv(initialStorage = {}, opts = {}) {
   const storage = { ...initialStorage };
@@ -91,12 +90,13 @@ function makeEnv(initialStorage = {}, opts = {}) {
   const notifications = [];
   const listeners = { push: [], pushsubscriptionchange: [], message: [], alarm: [], storageChanged: [], installed: [], startup: [], notificationClicked: [] };
   let fetchHandler = () => { throw new Error('fetch not stubbed'); };
+  let intervalSeq = 0;
   const fetchLog = [];
 
   const env = {
     storage, alarms, notifications, listeners, fetchLog, sentMessages: [],
-    // true: the offscreen document never answers nano-* messages (model host unreachable).
-    offscreenDown: false,
+    // Live setInterval timers (id -> { fn, ms }); they never fire on their own.
+    intervals: new Map(), platformInfoCalls: 0,
     setFetch(fn) { fetchHandler = fn; },
     sandbox: null,
   };
@@ -140,17 +140,13 @@ function makeEnv(initialStorage = {}, opts = {}) {
       onMessage: { addListener: (fn) => listeners.message.push(fn) },
       sendMessage: async (msg) => {
         env.sentMessages.push(msg.action);
+        ALL_SENT.push(msg.action);
+        // The offscreen document answers only clipboard writes.
         if (msg.action === 'clipboard-write') { env.clipboard = msg.text; return { copied: true }; }
-        if (msg.action.startsWith('nano-')) {
-          if (env.offscreenDown) return undefined;
-          if (env.offscreen) return env.offscreen.send(msg);
-          // Real offscreen document in a Chrome without the Prompt API.
-          if (msg.action === 'nano-availability') return { availability: 'unsupported' };
-          return { error: 'NotSupportedError: LanguageModel is not defined' };
-        }
         return undefined;
       },
       getContexts: async () => [{ contextType: 'OFFSCREEN_DOCUMENT' }],
+      getPlatformInfo: async () => { env.platformInfoCalls++; return { os: 'mac' }; },
       getURL: (p) => p,
       lastError: null,
     },
@@ -186,6 +182,8 @@ function makeEnv(initialStorage = {}, opts = {}) {
       return 0;
     },
     clearTimeout: () => {},
+    setInterval: (fn, ms) => { const id = ++intervalSeq; env.intervals.set(id, { fn, ms }); return id; },
+    clearInterval: (id) => { env.intervals.delete(id); },
     AbortController,
     self: {},
     importScripts: (...files) => {
@@ -202,13 +200,8 @@ function makeEnv(initialStorage = {}, opts = {}) {
       }
     },
   };
-  // Prompt API in the service worker itself, or only in the offscreen document.
-  // A browser with it in the worker has it in its pages too: the offscreen
-  // document shares the same model (and mock), which the worker falls back to
-  // after its own Prompt API fails.
+  // The Prompt API in the service worker, where Nano runs.
   if (opts.LanguageModel) sandbox.LanguageModel = opts.LanguageModel;
-  const offscreenLM = opts.offscreenLanguageModel || opts.LanguageModel;
-  if (offscreenLM) env.offscreen = makeOffscreen(offscreenLM);
   sandbox.self.registration = {
     pushManager: {
       getSubscription: async () => env.subscription ?? null,
@@ -398,18 +391,17 @@ test('cursor never moves backwards', async () => {
 });
 
 test('processing failure keeps message queued (cursor already advanced is OK)', async () => {
-  // Retryable failure: the model host (offscreen document) doesn't answer.
+  // Retryable failure: Gmail errors fetching the message.
   const lm = mockLanguageModel({ respond: () => '424242' });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { offscreenLanguageModel: lm });
-  env.offscreenDown = true;
-  mailFetch(env, { messages: { mfail: 'your code is 424242' } });
+  const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: lm });
+  mailFetch(env, { messages: { mfail: 'your code is 424242' }, routes: { '/messages/mfail?': () => jsonResponse({}, 503) } });
   await firePush(env);
   assert.deepStrictEqual([...env.storage.pendingMessageIds], ['mfail'], 'failed message stays queued');
   assert.strictEqual(env.storage.lastHistoryId, '200');
-  assert.ok(!env.storage.detectorError, 'an unreachable host is not "no model"');
+  assert.ok(!env.storage.detectorError, 'a Gmail error is not "no model"');
+  assert.strictEqual(lm.prompts.length, 0);
 
-  // Next push: the host answers again — message gets processed from the queue.
-  env.offscreenDown = false;
+  // Next push: Gmail answers again — message gets processed from the queue.
   mailFetch(env, { messages: { mfail: 'your code is 424242' }, history: [], historyId: '201' });
   await firePush(env);
   assert.deepStrictEqual([...env.storage.pendingMessageIds], [], 'queue drained');
@@ -607,11 +599,14 @@ test('restoreState recovers after a transient storage failure', async () => {
 
 test('processing stops at first retryable failure preserving order', async () => {
   let env;
-  // a1 is detected; right after, the model host stops answering, so a2 fails
-  // retryably before reaching the model.
-  const lm = mockLanguageModel({ respond: () => { env.offscreenDown = true; return '111111'; } });
-  env = makeEnv({ lastHistoryId: '10', pushActive: true }, { offscreenLanguageModel: lm });
-  mailFetch(env, { messages: { a1: 'code 111111', a2: 'code 222222', a3: 'code 333333' }, historyId: '20' });
+  // a1 is detected; then Gmail errors on a2, so it fails retryably before
+  // reaching the model.
+  const lm = mockLanguageModel({ respond: () => '111111' });
+  env = makeEnv({ lastHistoryId: '10', pushActive: true }, { LanguageModel: lm });
+  mailFetch(env, {
+    messages: { a1: 'code 111111', a2: 'code 222222', a3: 'code 333333' }, historyId: '20',
+    routes: { '/messages/a2?': () => jsonResponse({}, 503) },
+  });
   await firePush(env);
   // a1 processed; a2 failed -> stop; a3 still queued BEHIND a2 (order preserved)
   assert.deepStrictEqual([...env.storage.pendingMessageIds], ['a2', 'a3'], 'order preserved on failure');
@@ -624,7 +619,7 @@ test('processing stops at first retryable failure preserving order', async () =>
 // No usable on-device model: mail stays queued (not consumed as "no code") and
 // the notification names what's missing.
 for (const [opts, nano, advice] of [
-  [{}, 'unsupported', /Chrome 138\+/], // no Prompt API anywhere (offscreen reports 'unsupported')
+  [{}, 'unsupported', /Chrome 138\+/], // no Prompt API in the worker
   [{ LanguageModel: mockLanguageModel({ availability: 'unavailable', respond: () => '135790' }) }, 'unavailable', /isn't available on this device.*RAM/],
 ]) {
   test(`Nano ${nano}: mail stays queued and the error names the requirements`, async () => {
@@ -1051,7 +1046,8 @@ test('Nano path copies a code in the worker with no cloud fetch, one session per
   assert.strictEqual(lm.prompts.length, 1);
   assert.strictEqual(lm.created, 1, 'one session per email');
   assert.strictEqual(lm.destroyed, 1, 'session destroyed');
-  assert.ok(!env.sentMessages.includes('nano-detect'), 'ran in the worker, not offscreen');
+  assert.ok(env.sentMessages.includes('clipboard-write'));
+  assert.ok(!env.sentMessages.some((a) => a.startsWith('nano-')), 'ran in the worker, not offscreen');
 });
 
 test('Nano gets the shared prompt builder\'s text, the maxLength schema and English session options', async () => {
@@ -1067,24 +1063,6 @@ test('Nano gets the shared prompt builder\'s text, the maxLength schema and Engl
   assert.deepStrictEqual(JSON.parse(JSON.stringify(sessionOpts)), {
     expectedInputs: [{ type: 'text', languages: ['en'] }], expectedOutputs: [{ type: 'text', languages: ['en'] }],
   });
-});
-
-test('worker Prompt API says unavailable but the offscreen document has the model: monitoring starts and codes still copy there', async () => {
-  const workerLM = mockLanguageModel({ availability: 'unavailable', respond: () => '000000' });
-  const offscreenLM = mockLanguageModel({ respond: () => '864209' });
-  const env = makeEnv({ subVersion: 2 }, { LanguageModel: workerLM, offscreenLanguageModel: offscreenLM });
-  mailFetch(env, { routes: monitoringRoutes });
-  await env.sandbox.startMonitoring();
-  assert.strictEqual(env.storage.setupDone, true);
-  env.storage.pushActive = true;
-  mailFetch(env, { messages: { w1: 'Your verification code is 864209' } });
-  await firePush(env);
-  assert.strictEqual(env.clipboard, '864209');
-  assert.strictEqual(workerLM.prompts.length, 0, 'worker model never prompted');
-  assert.strictEqual(offscreenLM.prompts.length, 1);
-  assert.ok(env.sentMessages.includes('nano-detect'), 'ran in the offscreen document');
-  assert.ok(!env.storage.detectorError);
-  assert.strictEqual(cloudFetches(env), 0);
 });
 
 test('Nano downloadable: mail stays queued, detectorError set, a single notification; cleared once the model is ready', async () => {
@@ -1112,32 +1090,28 @@ test('Nano downloadable: mail stays queued, detectorError set, a single notifica
   assert.strictEqual(env.storage.detectorError, null, 'cleared on the next successful detection');
 });
 
-// Both hosts: the Prompt API in the worker itself, or only in the offscreen
-// document. lm.prompts counts prove the worker retries once, not both layers.
-for (const host of ['LanguageModel', 'offscreenLanguageModel']) {
-  test(`Nano throws once (${host}): retried on a fresh session and the code is copied`, async () => {
-    const lm = mockLanguageModel({ failPrompts: 1, respond: () => '246810' });
-    const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { [host]: lm });
-    mailFetch(env, { messages: { f1: 'Your code is 246810' } });
-    await firePush(env);
-    assert.strictEqual(env.clipboard, '246810');
-    assert.strictEqual(lm.prompts.length, 2, 'one retry');
-    assert.ok(lm.created >= 2, 'retry used a fresh session');
-    assert.ok(!env.storage.nanoFailStreak, 'a recovered email is not a failure');
-  });
+test('Nano throws once: retried on a fresh session and the code is copied', async () => {
+  const lm = mockLanguageModel({ failPrompts: 1, respond: () => '246810' });
+  const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm });
+  mailFetch(env, { messages: { f1: 'Your code is 246810' } });
+  await firePush(env);
+  assert.strictEqual(env.clipboard, '246810');
+  assert.strictEqual(lm.prompts.length, 2, 'one retry');
+  assert.strictEqual(lm.created, 2, 'retry used a fresh session');
+  assert.ok(!env.storage.nanoFailStreak, 'a recovered email is not a failure');
+});
 
-  test(`Nano throws twice (${host}): that message is consumed without a copy and the queue continues`, async () => {
-    const lm = mockLanguageModel({ failPrompts: 2, respond: (t) => (t.includes('222222') ? '222222' : '111111') });
-    const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { [host]: lm });
-    mailFetch(env, { messages: { x1: 'Your code is 111111', x2: 'Your code is 222222' } });
-    await firePush(env);
-    assert.strictEqual(lm.prompts.length, 3, 'x1 tried twice, x2 once');
-    assert.ok(lm.created >= 2, 'retry used a fresh session');
-    assert.strictEqual(env.clipboard, '222222', 'x1 skipped, x2 copied');
-    assert.deepStrictEqual(env.storage.pendingMessageIds, []);
-    assert.ok(!env.storage.detectorError);
-  });
-}
+test('Nano throws twice: that message is consumed without a copy and the queue continues', async () => {
+  const lm = mockLanguageModel({ failPrompts: 2, respond: (t) => (t.includes('222222') ? '222222' : '111111') });
+  const env = makeEnv({ lastHistoryId: '100', pushActive: true }, { LanguageModel: lm });
+  mailFetch(env, { messages: { x1: 'Your code is 111111', x2: 'Your code is 222222' } });
+  await firePush(env);
+  assert.strictEqual(lm.prompts.length, 3, 'x1 tried twice, x2 once');
+  assert.strictEqual(lm.created, 3, 'each try used a fresh session');
+  assert.strictEqual(env.clipboard, '222222', 'x1 skipped, x2 copied');
+  assert.deepStrictEqual(env.storage.pendingMessageIds, []);
+  assert.ok(!env.storage.detectorError);
+});
 
 test('Nano hangs: each try times out, the email is consumed and the queue continues', async () => {
   const lm = mockLanguageModel({ hang: true });
@@ -1150,20 +1124,50 @@ test('Nano hangs: each try times out, the email is consumed and the queue contin
   assert.strictEqual(env.storage.nanoFailStreak, 1);
 });
 
-test('service worker without LanguageModel runs Nano in the offscreen document (nano-detect message)', async () => {
-  const lm = mockLanguageModel({ respond: () => '192837' });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { offscreenLanguageModel: lm });
-  assert.strictEqual(typeof env.sandbox.LanguageModel, 'undefined');
-  mailFetch(env, { messages: { o1: 'Your security code is 192837' }, subject: 'Security code' });
-  await firePush(env);
-  assert.strictEqual(env.clipboard, '192837');
-  assert.ok(env.offscreen.received.includes('nano-availability'));
-  assert.ok(env.offscreen.received.includes('nano-detect'));
-  assert.strictEqual(lm.prompts.length, 1);
-  // Other actions are left for the worker / popup listeners.
-  assert.strictEqual(await env.offscreen.send({ action: 'getStatus' }), undefined);
-  const status = await ask(env, { action: 'getStatus' });
-  assert.strictEqual(status.nanoAvailability, 'available');
+// A pending prompt() is not worker activity, so a long Nano call would hit the
+// 30s idle timeout without the keep-alive ping.
+test('Nano keeps the worker alive while a prompt is pending and stops once it settles (success, throw, hang)', async () => {
+  const cases = [
+    [{ respond: () => '482913' }, {}, '482913'],
+    [{ failPrompts: 2 }, {}, undefined],
+    [{ hang: true }, { fireLongTimers: true }, undefined],
+  ];
+  for (const [lmOpts, envOpts, copied] of cases) {
+    let env;
+    const during = [];
+    const lm = mockLanguageModel({
+      ...lmOpts,
+      onPrompt: () => {
+        const live = [...env.intervals.values()];
+        const before = env.platformInfoCalls;
+        for (const { fn } of live) fn();
+        during.push({ live: live.length, ms: live.map((i) => i.ms), pinged: env.platformInfoCalls - before });
+      },
+    });
+    env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { ...envOpts, LanguageModel: lm });
+    mailFetch(env, { messages: { k1: 'Your code is 482913' } });
+    await firePush(env);
+    const label = JSON.stringify(lmOpts);
+    assert.strictEqual(env.clipboard, copied, label);
+    assert.ok(during.length >= 1, label);
+    for (const d of during) {
+      assert.strictEqual(d.live, 1, `${label}: one keep-alive interval during the prompt`);
+      assert.ok(d.ms[0] > 0 && d.ms[0] < 30000, `${label}: pings inside the 30s idle window`);
+      assert.ok(d.pinged >= 1, `${label}: the ping calls an extension API`);
+    }
+    assert.strictEqual(env.intervals.size, 0, `${label}: keep-alive cleared afterwards`);
+  }
+});
+
+test('offscreen.js answers clipboard writes only; Nano and every other action are left unanswered', async () => {
+  const doc = makeOffscreen();
+  assert.strictEqual((await doc.send({ action: 'clipboard-write', text: '192837' })).copied, true);
+  assert.strictEqual(doc.textarea.value, '192837');
+  for (const action of ['nano-detect', 'nano-availability', 'getStatus', 'codeDetected']) {
+    assert.strictEqual(await doc.send({ action }), undefined, `${action} is not answered`);
+  }
+  const page = fs.readFileSync(path.join(EXT_DIR, 'offscreen.html'), 'utf8');
+  assert.doesNotMatch(page, /nano\.js/, 'the offscreen document does not load Nano');
 });
 
 test('a body longer than the context window is truncated by fitBody to fit', async () => {
@@ -1210,22 +1214,16 @@ test('getStatus reports the model availability and no cloud fields', async () =>
   assert.deepStrictEqual(Object.keys(st), ['error']);
 });
 
-test('startMonitoring is allowed while the model is downloadable or its host is unreachable; refused when unavailable or unsupported', async () => {
+test('startMonitoring is allowed while the model is downloadable; refused when unavailable or unsupported', async () => {
   const env = makeEnv({ subVersion: 2 }, { LanguageModel: mockLanguageModel({ availability: 'downloadable' }) });
   mailFetch(env, { routes: monitoringRoutes });
   await env.sandbox.startMonitoring();
   assert.strictEqual(env.storage.setupDone, true);
   assert.strictEqual(env.storage.pushActive, true);
-  // Unreachable host: unknown, not "no model".
-  const envU = makeEnv({ subVersion: 2 }, { offscreenLanguageModel: mockLanguageModel() });
-  envU.offscreenDown = true;
-  mailFetch(envU, { routes: monitoringRoutes });
-  await envU.sandbox.startMonitoring();
-  assert.strictEqual(envU.storage.setupDone, true);
   const env2 = makeEnv({}, { LanguageModel: mockLanguageModel({ availability: 'unavailable' }) });
   await assert.rejects(env2.sandbox.startMonitoring(), /on-device model/);
   assert.ok(!env2.storage.setupDone);
-  const env3 = makeEnv({}); // offscreen reports 'unsupported'
+  const env3 = makeEnv({}); // no Prompt API in the worker
   await assert.rejects(env3.sandbox.startMonitoring(), /on-device model.*Chrome 138\+/);
   assert.ok(!env3.storage.setupDone);
 });
@@ -1281,17 +1279,8 @@ test('the download poll alarm notices the model is ready, clears detectorError a
   assert.ok(env2.alarms['nano-ready-poll']);
 });
 
-test('a failing in-worker Prompt API moves Nano to the offscreen document; repeated double failures raise one alert', async () => {
-  const workerLM = mockLanguageModel({ failPrompts: 99 });
-  const pageLM = mockLanguageModel({ respond: () => '515151' });
-  const env = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: workerLM, offscreenLanguageModel: pageLM });
-  mailFetch(env, { messages: { w1: 'Your code is 515151' } });
-  await firePush(env);
-  assert.strictEqual(env.clipboard, '515151', 'retry ran in the offscreen document');
-  assert.strictEqual(workerLM.prompts.length, 1);
-  assert.strictEqual(pageLM.prompts.length, 1);
-
-  // A model that fails everywhere: each code email is consumed, and after
+test('repeated double failures raise one alert; a success resets the streak', async () => {
+  // A model that always fails: each code email is consumed, and after
   // NANO_FAIL_ALERT_STREAK in a row the user is told (once).
   const lm = mockLanguageModel({ failPrompts: 99 });
   const env2 = makeEnv({ lastHistoryId: '100', pushActive: true, setupDone: true }, { LanguageModel: lm });
@@ -1338,6 +1327,11 @@ test('popup and manifests have no API key field or cloud model host', async () =
 test('popup.css keeps the hidden attribute authoritative over .btn display', async () => {
   const css = fs.readFileSync(path.join(EXT_DIR, 'popup.css'), 'utf8');
   assert.match(css, /\[hidden\]\s*\{\s*display:\s*none\s*!important;?\s*\}/);
+});
+
+test('no code path in this suite ever sent a nano-* message (Nano runs only in the worker)', async () => {
+  assert.ok(ALL_SENT.includes('clipboard-write'), 'the suite exercised the offscreen clipboard path');
+  assert.deepStrictEqual(ALL_SENT.filter((a) => /^nano-/.test(a)), []);
 });
 
 // Must stay the last test (node:test runs top-level tests in order): it checks

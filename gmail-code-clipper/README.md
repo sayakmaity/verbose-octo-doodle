@@ -45,7 +45,7 @@ gmail-code-clipper/          # Chrome extension
   config.example.js          Template — copy to config.js and fill in values
   manifest.json              Extension manifest (gitignored — has your OAuth client ID)
   manifest.example.json      Template — copy to manifest.json
-  offscreen.html + .js       Offscreen document: clipboard writes (MV3 requirement), and Gemini Nano when the service worker can't run it
+  offscreen.html + .js       Offscreen document: clipboard writes (MV3 requirement)
   popup.html + .js + .css    Popup UI: setup/status, model download, code history
   icon{16,48,128}.png        Extension icons
 
@@ -60,7 +60,7 @@ cloud-function/              # GCP Cloud Function (push relay)
 
 Codes are found by **Gemini Nano, Chrome's built-in on-device model** (Prompt API), and only by it. There is no cloud model and nothing to configure.
 
-- **Privacy:** the email text never leaves your machine. The extension reads the message from the Gmail API and the model runs locally. The extension's only hosts are the Gmail API and your own push relay.
+- **Privacy:** the email text never leaves your machine. The extension reads the message from the Gmail API and the model runs locally, in the extension's service worker. The extension's only hosts are the Gmail API and your own push relay.
 - **Requirements:** Chrome 138+, ~22 GB free disk on the drive with your Chrome profile (for the model), 16 GB RAM or a GPU with more than 4 GB VRAM, and macOS 13+, Windows 10+, Linux, or a ChromeOS Chromebook Plus. `chrome://on-device-internals` shows the model's state.
 - **Download:** if the model isn't on the machine yet, the popup shows **Download on-device model**. Chrome only starts the download from a click. Until it finishes, code emails stay queued rather than dropped (codes older than 15 minutes are still skipped as expired).
 - **Pre-filter:** before the model runs, a cheap subject/body check skips mail that isn't about a code: marketing, receipts, "your email was verified" notices. Most mail never reaches the model, and false copies drop sharply.

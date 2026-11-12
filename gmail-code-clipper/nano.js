@@ -1,6 +1,7 @@
 // Chrome's built-in Gemini Nano (Prompt API, global `LanguageModel`).
-// Plain script, no modules: loaded by the service worker (importScripts) and
-// by offscreen.html / popup.html (<script>), so every name here is a global.
+// Plain script, no modules: loaded by the service worker (importScripts),
+// where Nano runs, and by popup.html (<script>) for the download button, so
+// every name here is a global.
 // Nothing at top level touches LanguageModel: contexts without the Prompt API
 // can load this file safely.
 

@@ -48,7 +48,6 @@ function noEngineReason(nano) {
   if (nano === 'downloadable') return "Codes aren't being copied — download the on-device model below.";
   if (nano === 'downloading') return "Codes aren't being copied yet — the on-device model is downloading.";
   if (nano === 'unavailable') return "Codes aren't being copied — this device can't run the on-device model.";
-  if (nano === 'unknown') return "Codes aren't being copied — couldn't reach the on-device model. Reopen the popup.";
   return "Codes aren't being copied — this Chrome has no on-device model (needs Chrome 138+).";
 }
 

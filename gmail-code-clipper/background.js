@@ -16,7 +16,7 @@ const NANO_TIMEOUT_MS = 60000;
 // dead code on the clipboard, and bounds how long one failing message can
 // block the queue.
 const MAX_CODE_AGE_MS = 15 * 60000;
-// Bounds the text handed to the model host; nano.js then cuts it further to
+// Bounds the text handed to the model; nano.js then cuts it further to
 // fit the on-device context window. Real emails are far below it (largest
 // seen after cleanup: ~20K chars). MAX_RAW_PART_CHARS just bounds work on
 // pathological multi-MB parts; stripping is linear.
@@ -307,20 +307,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'getStatus') {
     restoreState()
       .then(async () => {
-        // 'unknown' when the model host didn't answer: not evidence of no model.
-        const nanoAvailability = await getNanoAvailability().catch(() => 'unknown');
-        if (nanoAvailability === 'available') await clearDetectorError();
+        const availability = await nanoAvailability();
+        if (availability === 'available') await clearDetectorError();
         const { nanoFailStreak = 0 } = await chrome.storage.local.get('nanoFailStreak');
         sendResponse({
           setupDone, pushActive, needsAuth, pushError,
-          nanoAvailability, detectorError,
+          nanoAvailability: availability, detectorError,
           nanoFailing: nanoFailStreak >= NANO_FAIL_ALERT_STREAK,
         });
       })
       .catch((err) => sendResponse({ error: err.message }));
     return true;
   }
-  // Every other action (clipboard-write, nano-*, codeDetected) is for other
+  // Every other action (clipboard-write, codeDetected) is for other
   // listeners: don't pre-empt their sendResponse.
   return false;
 });
@@ -341,9 +340,8 @@ async function startMonitoring() {
 
   // Refuse only when the on-device model can NEVER run here. 'downloadable' is
   // fine: the popup offers the download, and until it finishes mail stays
-  // queued (detectorError) instead of being consumed as "no code". An
-  // unreachable host is unknown, not "no model": don't refuse on it.
-  const nano = await getNanoAvailability().catch(() => null);
+  // queued (detectorError) instead of being consumed as "no code".
+  const nano = await nanoAvailability();
   if (nano === 'unavailable' || nano === 'unsupported') {
     throw new Error(NANO_UNAVAILABLE_MESSAGE);
   }
@@ -638,7 +636,7 @@ async function processPendingQueue() {
         await setDetectorError(err.message, err.nano);
         break;
       } else {
-        // Retryable (model host unreachable, network blip): stop here so arrival
+        // Retryable (network blip, Gmail error): stop here so arrival
         // order is preserved; the queue is durable and the next push or
         // health check retries from this point. A message can't block the
         // queue for long: once older than MAX_CODE_AGE_MS it's skipped.
@@ -883,13 +881,7 @@ function looksLikeCodeEmail(subject, body) {
 // Gemini Nano, Chrome's on-device model, is the only engine: the email text
 // never leaves the machine. -> a grounded code, or null.
 async function detectCode(subject, from, body) {
-  const nano = await getNanoAvailability().catch((err) => {
-    console.warn('On-device model host unreachable:', err.message);
-    return null;
-  });
-  // Host unreachable (offscreen document didn't answer): transient, retry the
-  // drain later rather than reporting a missing model.
-  if (nano === null) throw new Error('On-device model host unreachable');
+  const nano = await nanoAvailability();
   if (nano !== 'available') throw new DetectorUnavailableError(nano);
 
   for (let attempt = 1; ; attempt++) {
@@ -908,8 +900,7 @@ async function detectCode(subject, from, body) {
         return null;
       }
       // ~3% of runs throw a generic UnknownError (none seen on code emails).
-      // The retry gets a fresh session (in the offscreen document if the
-      // worker's Prompt API just failed).
+      // The retry gets a fresh session.
       console.warn('Gemini Nano failed, retrying with a fresh session:', err.message);
     }
   }
@@ -987,7 +978,7 @@ async function clearDetectorError() {
 // it (aged out, filtered by the gate).
 async function clearDetectorErrorIfReady() {
   if (!detectorError) return;
-  if ((await getNanoAvailability().catch(() => null)) === 'available') await clearDetectorError();
+  if ((await nanoAvailability()) === 'available') await clearDetectorError();
 }
 
 // The popup starts the download (it needs a user click) but closes long before
@@ -1001,73 +992,26 @@ async function watchNanoDownload() {
 
 async function pollNanoReady() {
   const { nanoPollUntil = 0 } = await chrome.storage.local.get('nanoPollUntil');
-  const nano = await getNanoAvailability().catch(() => null);
+  const nano = await nanoAvailability();
   if (nano === 'available') {
     chrome.alarms.clear('nano-ready-poll');
     await clearDetectorError();
     if (setupDone) await checkForNewEmails();
     return;
   }
-  const waiting = nano === null || nano === 'downloading' || nano === 'downloadable';
+  const waiting = nano === 'downloading' || nano === 'downloadable';
   if (!waiting || Date.now() > nanoPollUntil) chrome.alarms.clear('nano-ready-poll');
 }
 
-// --- On-device model host ---
-// The Prompt API isn't available in Web Workers, and whether an extension
-// service worker exposes it is unconfirmed. Use it here when it exists;
-// otherwise run nano.js in the offscreen document (a top-level page).
+// --- On-device model ---
+// The Prompt API runs in the extension service worker itself.
 
-// Set after the worker's own Prompt API fails once: whether it really works in
-// an extension service worker is unconfirmed, and the offscreen document (a
-// top-level page) is known to. Lasts for this worker's lifetime.
-let nanoWorkerBroken = false;
-
-function nanoInWorker() {
-  return !nanoWorkerBroken && typeof LanguageModel !== 'undefined' && typeof nanoExtract === 'function';
+function runNano(input, timeoutMs) {
+  return withKeepAlive(() => nanoExtract(input, { timeoutMs }));
 }
 
-async function getNanoAvailability() {
-  if (nanoInWorker()) {
-    // nanoAvailability() maps a throw to 'unavailable'. Don't trust a "no" from
-    // the worker alone: switch to the offscreen document and let it decide.
-    const worker = await nanoAvailability();
-    if (worker !== 'unavailable' && worker !== 'unsupported') return worker;
-    nanoWorkerBroken = true;
-  }
-  const resp = await offscreenRequest({ action: 'nano-availability' });
-  if (resp.error) throw new Error(resp.error);
-  return resp.availability;
-}
-
-async function runNano(input, timeoutMs) {
-  return withKeepAlive(async () => {
-    if (nanoInWorker()) {
-      try {
-        return await nanoExtract(input, { timeoutMs });
-      } catch (err) {
-        nanoWorkerBroken = true;
-        throw err;
-      }
-    }
-    // nano.js enforces timeoutMs in the document; this guards a document
-    // that never answers at all.
-    let timer;
-    const hung = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Offscreen model host timed out')), timeoutMs + 15000);
-    });
-    try {
-      const resp = await Promise.race([offscreenRequest({ action: 'nano-detect', ...input, timeoutMs }), hung]);
-      if (resp.error) throw new Error(resp.error);
-      return resp;
-    } finally {
-      clearTimeout(timer);
-    }
-  });
-}
-
-// A Nano call can outlast the worker's 30s idle timer, and neither prompt()
-// nor waiting on the offscreen reply counts as activity. Any extension API
-// call resets it.
+// A Nano call can outlast the worker's 30s idle timer, and a pending prompt()
+// doesn't count as activity. Any extension API call resets it.
 async function withKeepAlive(fn) {
   const ping = typeof setInterval === 'function'
     ? setInterval(() => { chrome.runtime.getPlatformInfo?.()?.catch?.(() => {}); }, 20000)
@@ -1077,20 +1021,6 @@ async function withKeepAlive(fn) {
   } finally {
     if (ping !== null) clearInterval(ping);
   }
-}
-
-// Retry instead of a fixed delay: a just-created document's listener may not
-// be registered yet.
-async function offscreenRequest(message) {
-  await ensureOffscreenDocument();
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      const resp = await chrome.runtime.sendMessage(message);
-      if (resp) return resp;
-    } catch { /* receiving end not ready yet */ }
-    await sleep(150);
-  }
-  throw new Error('Offscreen document did not answer');
 }
 
 // --- Code sanity filter ---
@@ -1146,9 +1076,7 @@ async function ensureOffscreenDocument() {
   offscreenCreating ??= chrome.offscreen.createDocument({
     url: 'offscreen.html',
     reasons: ['CLIPBOARD'],
-    // CLIPBOARD is the only fitting reason; the same document also hosts the
-    // on-device model when the service worker has no Prompt API.
-    justification: 'Copy login codes to the clipboard, and run Chrome\'s on-device model (Gemini Nano) to find them in new emails',
+    justification: 'Copy login codes to the clipboard',
   }).finally(() => { offscreenCreating = null; });
   try {
     await offscreenCreating;
@@ -1157,6 +1085,20 @@ async function ensureOffscreenDocument() {
     // document existed, and that caller's create finished first.
     if (!/single offscreen/i.test(err?.message || '')) throw err;
   }
+}
+
+// Retry instead of a fixed delay: a just-created document's listener may not
+// be registered yet.
+async function offscreenRequest(message) {
+  await ensureOffscreenDocument();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const resp = await chrome.runtime.sendMessage(message);
+      if (resp) return resp;
+    } catch { /* receiving end not ready yet */ }
+    await sleep(150);
+  }
+  throw new Error('Offscreen document did not answer');
 }
 
 async function copyToClipboard(text) {
